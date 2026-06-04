@@ -29,6 +29,10 @@ from bomberman.env import BombermanEnv
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Manually play Bomberman.")
+    parser.add_argument("--width", type=int, default=11,
+                        help="width of the game grid")
+    parser.add_argument("--height", type=int, default=11,
+                        help="height of the game grid")
     parser.add_argument("--enemy-bombs", action="store_true",
                         help="let scripted enemies drop bombs")
     parser.add_argument("--enemy-bomb-prob", type=float, default=0.4,
@@ -45,11 +49,14 @@ def main() -> int:
 
     args = parse_args()
     config = GameConfig(
+        width=args.width,
+        height=args.height,
         n_enemies=args.enemies,
         enemies_drop_bombs=args.enemy_bombs,
         enemy_bomb_prob=args.enemy_bomb_prob,
     )
     print(
+        f"Starting Bomberman with config: {config.width}x{config.height} "
         f"enemy_bombs={'ON' if args.enemy_bombs else 'OFF'} "
         f"(prob={args.enemy_bomb_prob}) enemies={args.enemies} "
         f"show_state={'ON' if args.show_state else 'OFF'}"
