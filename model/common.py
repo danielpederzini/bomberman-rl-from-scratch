@@ -8,5 +8,5 @@ def register_layer(layer_type: str, layer_class: type):
 
 def initialize_weights(input_size: int, num_neurons: int):
     """Import from utils to avoid circular dependency"""
-    from utils import initialize_weights as _init_weights
+    from model.utils import initialize_weights as _init_weights
     return _init_weights(input_size, num_neurons)
