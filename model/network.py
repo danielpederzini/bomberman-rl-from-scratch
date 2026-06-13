@@ -1,10 +1,10 @@
 import cupy as cp
-from common import LAYER_TYPES
-from layer import Layer
+from model.common import LAYER_TYPES
+from model.layer import Layer
 
 LAYER_TYPES["dense"] = Layer
 
-class Network:
+class DQNetwork:
     def __init__(self, layer_definitions: list[dict]):
         self.layers = self.initialize_layers(layer_definitions)
 
@@ -24,3 +24,10 @@ class Network:
         for layer in self.layers:
             output = layer.forward(output)
         return output
+    
+    def loss(self, predictions: cp.ndarray, targets: cp.ndarray) -> cp.ndarray:
+        return cp.mean(cp.square(predictions - targets))
+
+    def backward(self, grad: cp.ndarray):
+        for layer in reversed(self.layers):
+            grad = layer.backward(grad)
