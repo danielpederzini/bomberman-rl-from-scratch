@@ -3,45 +3,26 @@
 Two things are exposed:
 
 * :meth:`ObservationBuilder.features` - a flat ``np.float32`` vector built from
-  ray-casts in N directions plus a handful of scalar features. This is the
-  default observation and is ready for an MLP DQN.
-* :meth:`ObservationBuilder.raw_state` - a dict of ground-truth game state
-  (grid, positions, bombs, blasts) so you can build your own representation.
-
-Ray-cast semantics: from the agent, walk outward one cell at a time. The ray
-records the first crate / enemy / bomb it meets and is blocked by unbreakable
-walls and crates (you cannot "see" past them). Distances are normalised to
-``[0, 1]`` where ``1.0`` means "nothing of that kind is visible in that
-direction".
+  an absolute full-board ``height x width`` grid (5 channels) plus scalar
+  features. The whole board is always visible (no agent-centered window).
+  Grid channels:
+      ch0 - tile:        0=empty, 0.5=crate, 1=wall
+      ch1 - danger:      1 if in predicted blast range, else 0
+      ch2 - blast:       1 if active blast present, else 0
+      ch3 - bomb_imminence: 0=no bomb, 1=detonating next tick
+      ch4 - entity:      0=empty, 0.5=enemy, 1=agent
+  Spatial size: height*width*5 (e.g. 11*11*5 = 605).  Scalars: 7.
+* :meth:`ObservationBuilder.raw_state` - a dict of ground-truth game state.
 """
 
 from __future__ import annotations
-
-from dataclasses import dataclass
 
 import numpy as np
 
 from bomberman.entities import Tile
 from bomberman.game import Game
 
-# 4-connected directions (up, down, left, right).
-DIRS_4 = ((-1, 0), (1, 0), (0, -1), (0, 1))
-# Diagonals, appended when 8 directions are requested.
-DIRS_8 = DIRS_4 + ((-1, -1), (-1, 1), (1, -1), (1, 1))
-
-# Human-readable names for each direction (used by visualisation).
-DIR_NAMES = {
-    (-1, 0): "UP",
-    (1, 0): "DOWN",
-    (0, -1): "LEFT",
-    (0, 1): "RIGHT",
-    (-1, -1): "UL",
-    (-1, 1): "UR",
-    (1, -1): "DL",
-    (1, 1): "DR",
-}
-
-# Labels for the scalar features, in order (see _scalar_features).
+_N_CHANNELS = 5
 SCALAR_NAMES = [
     "on_danger",
     "can_bomb",
@@ -51,99 +32,233 @@ SCALAR_NAMES = [
     "agent_col",
     "min_fuse",
 ]
-
-# Number of distance features recorded per ray: wall, crate, enemy, bomb.
-_FEATURES_PER_RAY = 4
-# Number of global scalar features (see _scalar_features).
 _SCALAR_FEATURES = len(SCALAR_NAMES)
 
 
-@dataclass
-class RayHit:
-    wall: float = 1.0
-    crate: float = 1.0
-    enemy: float = 1.0
-    bomb: float = 1.0
-
-    def as_list(self) -> list[float]:
-        return [self.wall, self.crate, self.enemy, self.bomb]
-
-
 class ObservationBuilder:
-    def __init__(self, game: Game, n_ray_dirs: int = 4):
-        if n_ray_dirs not in (4, 8):
-            raise ValueError("n_ray_dirs must be 4 or 8")
-        self.game = game
-        self.dirs = DIRS_8 if n_ray_dirs == 8 else DIRS_4
-        self.max_dim = max(game.config.width, game.config.height)
+    """Build observation vectors from game state for the RL agent."""
 
-    # ------------------------------------------------------------------ #
+    def __init__(self, game: Game, n_ray_dirs: int | None = None):
+        """Initialize with game reference and optional ray casting configuration.
+
+        Args:
+            game: The Bomberman game instance to observe.
+            n_ray_dirs: Number of ray directions for ray casting (4, 8, or None).
+        """
+        self.game = game
+        self.max_dim = max(game.config.width, game.config.height)
+        self.n_ray_dirs = n_ray_dirs
+
+    @property
+    def board_shape(self) -> tuple[int, int, int]:
+        """Return the shape of the observation grid (height, width, channels)."""
+        return (self.game.config.height, self.game.config.width, _N_CHANNELS)
+
+    @property
+    def spatial_size(self) -> int:
+        """Return the total size of the flattened spatial grid."""
+        height, width, channels = self.board_shape
+        return height * width * channels
+
     @property
     def size(self) -> int:
-        return len(self.dirs) * _FEATURES_PER_RAY + _SCALAR_FEATURES
+        """Return the total observation vector size (spatial + scalars)."""
+        return self.spatial_size + len(self.scalar_names())
 
     def features(self) -> np.ndarray:
+        """Build and return the full observation vector for the current game state.
+
+        The observation consists of:
+        - Spatial features: Flattened height x width x 5 grid encoding tiles,
+          danger zones, active blasts, bomb timers, and entity positions
+        - Scalar features: 7 (or more with rays) normalized metrics like
+          agent position, enemy proximity, and bomb readiness
+
+        Returns:
+            Flat float32 vector of length self.size.
+        """
         game = self.game
         agent = game.agent
-        features: list[float] = []
 
-        # If the agent is dead, return a zero vector (terminal anyway).
         if not agent.alive:
             return np.zeros(self.size, dtype=np.float32)
 
-        enemy_positions = {enemy.pos for enemy in game.enemies if enemy.alive}
-        bomb_positions = {bomb.pos for bomb in game.bombs}
+        spatial = self._board_grid()
+        scalars = np.asarray(self._scalar_features(), dtype=np.float32)
+        return np.concatenate([spatial, scalars])
 
-        for row_delta, col_delta in self.dirs:
-            features.extend(
-                self._cast_ray(
-                    agent.pos,
-                    row_delta,
-                    col_delta,
-                    enemy_positions,
-                    bomb_positions,
-                ).as_list()
-            )
+    def _board_grid(self) -> np.ndarray:
+        """Build a flattened absolute (height x width x 5) grid of the whole board.
 
-        features.extend(self._scalar_features())
-        return np.asarray(features, dtype=np.float32)
-
-    # ------------------------------------------------------------------ #
-    def _cast_ray(
-        self,
-        start_position,
-        row_delta,
-        col_delta,
-        enemy_positions,
-        bomb_positions,
-    ) -> RayHit:
+        Channels:
+        - 0: Tile type (0=empty, 0.5=crate, 1=wall)
+        - 1: Danger flag (1 if in blast range)
+        - 2: Active blast flag (1 if explosion present)
+        - 3: Bomb imminence (0=no bomb, rising to 1=detonating next tick)
+        - 4: Entity (0=empty, 0.5=enemy, 1=agent)
+        """
         game = self.game
-        ray_hit = RayHit()
-        row, col = start_position
-        for distance in range(1, self.max_dim):
-            row += row_delta
-            col += col_delta
-            ray_position = (row, col)
-            if not game.in_bounds(ray_position):
-                ray_hit.wall = self._norm(distance)
-                break
-            normalized_distance = self._norm(distance)
-            # Record dynamic objects (only the first, closest one).
-            if ray_position in bomb_positions and ray_hit.bomb == 1.0:
-                ray_hit.bomb = normalized_distance
-            if ray_position in enemy_positions and ray_hit.enemy == 1.0:
-                ray_hit.enemy = normalized_distance
+        height, width = game.config.height, game.config.width
 
-            tile = game.tile_at(ray_position)
+        danger_cells = game.predict_danger_cells()
+        blast_cells = game.blast_cells()
+        fuse = max(1, game.config.bomb_fuse)
+        bomb_map = {
+            bomb.pos: (fuse - bomb.timer + 1) / fuse
+            for bomb in game.bombs
+        }
+        enemy_positions = {enemy.pos for enemy in game.enemies if enemy.alive}
+        agent_pos = game.agent.pos
+
+        grid = np.zeros((height, width, _N_CHANNELS), dtype=np.float32)
+
+        for row in range(height):
+            for column in range(width):
+                position = (row, column)
+                tile = game.tile_at(position)
+                if tile == Tile.WALL:
+                    grid[row, column, 0] = 1.0
+                elif tile == Tile.CRATE:
+                    grid[row, column, 0] = 0.5
+
+                grid[row, column, 1] = 1.0 if position in danger_cells else 0.0
+                grid[row, column, 2] = 1.0 if position in blast_cells else 0.0
+                grid[row, column, 3] = bomb_map.get(position, 0.0)
+                if position == agent_pos:
+                    grid[row, column, 4] = 1.0
+                elif position in enemy_positions:
+                    grid[row, column, 4] = 0.5
+
+        return grid.flatten()
+
+    def scalar_names(self) -> list[str]:
+        """Return list of scalar feature names.
+
+        Includes base 7 features plus ray casting features if enabled.
+
+        Returns:
+            List of feature name strings.
+        """
+        names = list(SCALAR_NAMES)
+        if self.n_ray_dirs is None or self.n_ray_dirs <= 0:
+            return names
+        for ray_idx in range(self.n_ray_dirs):
+            names.extend([f"ray_{ray_idx}_dist", f"ray_{ray_idx}_type"])
+        return names
+
+    def _ray_directions(self) -> list[tuple[int, int]]:
+        """Calculate direction vectors for ray casting.
+
+        Returns:
+            List of (row_delta, column_delta) tuples for each ray direction.
+        """
+        if self.n_ray_dirs is None or self.n_ray_dirs <= 0:
+            return []
+        if self.n_ray_dirs == 4:
+            return [(-1, 0), (1, 0), (0, -1), (0, 1)]
+        if self.n_ray_dirs == 8:
+            return [(-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (-1, 1), (1, -1), (1, 1)]
+        directions = []
+        for ray_idx in range(self.n_ray_dirs):
+            angle = (2 * np.pi * ray_idx) / self.n_ray_dirs
+            directions.append((int(round(np.sin(angle))), int(round(np.cos(angle)))))
+        return directions
+
+    def ray_casts(self) -> list[dict[str, object]]:
+        """Cast rays in all directions to detect walls, crates, bombs, and enemies.
+
+        Returns:
+            List of ray hit dictionaries containing position, normalized distance,
+            and hit type for each direction.
+        """
+        if self.n_ray_dirs is None or self.n_ray_dirs <= 0:
+            return []
+        if not self.game.agent.alive:
+            return []
+
+        agent_pos = self.game.agent.pos
+        rays: list[dict[str, object]] = []
+        for row_delta, column_delta in self._ray_directions():
+            hit_pos, hit_type = self._cast_single_ray(agent_pos, row_delta, column_delta)
+            distance = abs(hit_pos[0] - agent_pos[0]) + abs(hit_pos[1] - agent_pos[1])
+            distance_norm = distance / max(1, self.max_dim)
+            hit_value = {
+                "empty": 0.0,
+                "crate": 0.25,
+                "bomb": 0.5,
+                "enemy": 0.75,
+                "wall": 1.0,
+            }[hit_type]
+            rays.append(
+                {
+                    "hit_pos": hit_pos,
+                    "distance_norm": distance_norm,
+                    "hit_type": hit_value,
+                    "hit_type_name": hit_type,
+                }
+            )
+        return rays
+
+    def _cast_single_ray(
+        self,
+        origin: tuple[int, int],
+        row_delta: int,
+        column_delta: int,
+    ) -> tuple[tuple[int, int], str]:
+        """Cast a single ray in a direction and return what it hits.
+
+        Args:
+            origin: Starting position of the ray.
+            row_delta: Row direction offset (-1, 0, or 1).
+            column_delta: Column direction offset (-1, 0, or 1).
+
+        Returns:
+            Tuple of (hit_position, hit_type) where hit_type is one of:
+            "empty", "wall", "crate", "bomb", "enemy".
+        """
+        hit_pos: tuple[int, int] | None = None
+        hit_type = "empty"
+
+        for step in range(1, self.max_dim + 1):
+            candidate = (
+                origin[0] + row_delta * step,
+                origin[1] + column_delta * step,
+            )
+            if not self.game.in_bounds(candidate):
+                break
+
+            tile = self.game.tile_at(candidate)
             if tile == Tile.WALL:
-                ray_hit.wall = normalized_distance
+                hit_pos = candidate
+                hit_type = "wall"
                 break
             if tile == Tile.CRATE:
-                ray_hit.crate = normalized_distance
-                break  # crate blocks line of sight
-        return ray_hit
+                hit_pos = candidate
+                hit_type = "crate"
+                break
+            if self.game.bomb_at(candidate) is not None:
+                hit_pos = candidate
+                hit_type = "bomb"
+                break
+            if self.game.alive_player_at(candidate, exclude_pid=self.game.agent.pid) is not None:
+                hit_pos = candidate
+                hit_type = "enemy"
+                break
+            hit_pos = candidate
+
+        if hit_pos is None:
+            hit_pos = origin
+        return hit_pos, hit_type
 
     def _scalar_features(self) -> list[float]:
+        """Compute 7 base scalar features for the agent.
+
+        Features include danger status, bomb capacity, enemy proximity,
+        enemy count, normalized position, and minimum bomb timer.
+
+        Returns:
+            List of normalized float features.
+        """
         game = self.game
         agent = game.agent
         danger_cells = game.predict_danger_cells()
@@ -163,9 +278,8 @@ class ObservationBuilder:
         enemy_alive_fraction = len(alive_enemies) / max(1, game.config.n_enemies)
 
         agent_row_norm = agent.pos[0] / game.config.height
-        agent_col_norm = agent.pos[1] / game.config.width
+        agent_column_norm = agent.pos[1] / game.config.width
 
-        # Smallest fuse among bombs whose blast reaches the agent (1.0 if none).
         min_threatening_bomb_timer_norm = 1.0
         for bomb in game.bombs:
             if agent.pos in danger_cells:
@@ -174,74 +288,33 @@ class ObservationBuilder:
                     bomb.timer / max(1, game.config.bomb_fuse),
                 )
 
-        return [
+        features = [
             on_danger,
             can_bomb,
             nearest_enemy_distance_norm,
             enemy_alive_fraction,
             agent_row_norm,
-            agent_col_norm,
+            agent_column_norm,
             min_threatening_bomb_timer_norm,
         ]
+        for ray in self.ray_casts():
+            features.append(float(ray["distance_norm"]))
+            features.append(float(ray["hit_type"]))
+        return features
 
-    def _norm(self, distance: int) -> float:
-        return min(1.0, distance / self.max_dim)
-
-    # ------------------------------------------------------------------ #
-    def ray_visualization(self) -> list[dict]:
-        """Structured ray data for rendering overlays.
-
-        Returns one dict per direction with:
-            ``dir``   - the (drow, dcol) step,
-            ``name``  - human-readable direction name,
-            ``cells`` - list of grid cells the ray passes through (in order),
-            ``hits``  - mapping of {"wall"/"crate"/"enemy"/"bomb": cell} for the
-                        first object of each type the ray meets.
-        """
-        game = self.game
-        agent = game.agent
-        if not agent.alive:
-            return []
-
-        enemy_positions = {enemy.pos for enemy in game.enemies if enemy.alive}
-        bomb_positions = {bomb.pos for bomb in game.bombs}
-
-        rays: list[dict] = []
-        for row_delta, col_delta in self.dirs:
-            ray_cells: list = []
-            hits: dict = {}
-            row, col = agent.pos
-            for _ in range(1, self.max_dim):
-                row += row_delta
-                col += col_delta
-                ray_position = (row, col)
-                if not game.in_bounds(ray_position):
-                    break
-                ray_cells.append(ray_position)
-                if "bomb" not in hits and ray_position in bomb_positions:
-                    hits["bomb"] = ray_position
-                if "enemy" not in hits and ray_position in enemy_positions:
-                    hits["enemy"] = ray_position
-                tile = game.tile_at(ray_position)
-                if tile == Tile.WALL:
-                    hits["wall"] = ray_position
-                    break
-                if tile == Tile.CRATE:
-                    hits["crate"] = ray_position
-                    break
-            rays.append(
-                {
-                    "dir": (row_delta, col_delta),
-                    "name": DIR_NAMES[(row_delta, col_delta)],
-                    "cells": ray_cells,
-                    "hits": hits,
-                }
-            )
-        return rays
-
-    # ------------------------------------------------------------------ #
     def raw_state(self) -> dict:
-        """Ground-truth state for building custom representations / debugging."""
+        """Return ground-truth game state for debugging and custom representations.
+
+        Contains:
+        - grid: Full board state as numpy array
+        - agent_pos: Current agent coordinates
+        - agent_alive: Whether agent is alive
+        - enemy_positions: List of (position, alive) tuples for all enemies
+        - bombs: List of (position, timer, owner_id, range) tuples
+        - blasts: List of (position, timer) tuples
+        - danger_cells: Sorted list of positions in blast range
+        - step: Current game tick count
+        """
         game = self.game
         return {
             "grid": game.grid.copy(),
