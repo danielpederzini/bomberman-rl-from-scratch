@@ -4,10 +4,8 @@ from __future__ import annotations
 
 from enum import IntEnum
 
-
 class Action(IntEnum):
     """The six discrete actions an agent can take on a single tick."""
-
     UP = 0
     DOWN = 1
     LEFT = 2
@@ -27,8 +25,6 @@ class Action(IntEnum):
         """
         return _DELTAS[self]
 
-
-# (drow, dcol) deltas. Rows increase downward, cols increase rightward.
 _DELTAS: dict[Action, tuple[int, int]] = {
     Action.UP: (-1, 0),
     Action.DOWN: (1, 0),
@@ -39,5 +35,4 @@ _DELTAS: dict[Action, tuple[int, int]] = {
 }
 
 _MOVE_ACTIONS = frozenset({Action.UP, Action.DOWN, Action.LEFT, Action.RIGHT})
-
 NUM_ACTIONS = len(Action)
