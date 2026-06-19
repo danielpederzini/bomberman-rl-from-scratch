@@ -149,15 +149,16 @@ class BombermanEnv(gym.Env):
         return reward
 
     def _compute_bomb_placement_bonus(self, agent_action: Action | None, agent_bombs_before: int) -> float:
-        """Compute bonus for placing a bomb that threatens a target."""
-        if (
-            self.config.reward_bomb_target
-            and agent_action == Action.BOMB
+        """Bonus for a bomb that threatens a target, penalty for a wasted bomb."""
+        placed_bomb = (
+            agent_action == Action.BOMB
             and self.game.agent.active_bombs > agent_bombs_before
-            and self._bomb_threatens_target()
-        ):
+        )
+        if not placed_bomb:
+            return 0.0
+        if self._bomb_threatens_target():
             return self.config.reward_bomb_target
-        return 0.0
+        return self.config.reward_bomb_spam
 
     def _compute_terminal_reward(self, agent_alive_before: bool) -> float:
         """Compute reward for terminal outcomes (death or win)."""
@@ -200,9 +201,9 @@ class BombermanEnv(gym.Env):
         was_in_danger = agent_pos_before in self.game.predict_danger_cells()
         now_in_danger = agent.pos in self.game.predict_danger_cells()
         if was_in_danger and not now_in_danger:
-            return 0.5
+            return self.config.reward_escape_danger
         if not was_in_danger and now_in_danger:
-            return -0.3
+            return self.config.reward_enter_danger
         return 0.0
 
     def _potential(self) -> float:
