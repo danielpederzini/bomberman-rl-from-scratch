@@ -72,6 +72,8 @@ _COLORS = {
     "text": (220, 220, 230),
     "text_dim": (140, 140, 160),
     "ray": (90, 200, 120),
+    "reward": (100, 255, 150),  # Green for positive rewards
+    "penalty": (255, 80, 80),   # Red for negative rewards
 }
 
 _HIT_COLORS = {
@@ -108,12 +110,51 @@ class PygameRenderer:
 
         self.board_w = config.width * cell_size
         self.board_h = config.height * cell_size
-        panel = _PANEL_WIDTH if show_state else 0
-        self.screen = pygame.display.set_mode((self.board_w + panel, self.board_h))
+
+        if show_state:
+            self.panel_w = 400
+            self.panel_h = self._calculate_panel_height(config)
+            game_stats_height = 220  # Height for game stats, events, and Q-values below board
+            window_w = self.board_w + self.panel_w
+            window_h = max(self.board_h + game_stats_height, self.panel_h)
+        else:
+            self.panel_w = 0
+            self.panel_h = 0
+            window_w = self.board_w
+            window_h = self.board_h
+
+        self.screen = pygame.display.set_mode((window_w, window_h))
         self.font = pygame.font.SysFont("consolas", 14)
         self.font_small = pygame.font.SysFont("consolas", 12)
         self.clock = pygame.time.Clock()
         self.fps = fps
+        self.event_history: list[tuple[int, str, float]] = []
+        self.episode_metrics: dict[str, float] = {
+            "reward": 0.0,
+            "steps": 0,
+            "crates": 0,
+            "kills": 0,
+        }
+        self.current_qvalues: list[float] = [0.0] * 6
+        self.selected_action: int = 0
+
+    def record_event(self, step: int, event_type: str, details: str = "", reward: float = 0.0) -> None:
+        """Record a game event for the event log (max 6 entries)."""
+        self.event_history.append((step, f"{event_type} {details}", reward))
+        if len(self.event_history) > 6:
+            self.event_history.pop(0)
+
+    def update_episode_metrics(self, reward: float, steps: int, crates: int, kills: int) -> None:
+        """Update cumulative episode statistics."""
+        self.episode_metrics["reward"] = reward
+        self.episode_metrics["steps"] = steps
+        self.episode_metrics["crates"] = crates
+        self.episode_metrics["kills"] = kills
+
+    def record_qvalues(self, q_values: list[float], selected_action: int) -> None:
+        """Store Q-values for visualization."""
+        self.current_qvalues = q_values
+        self.selected_action = selected_action
 
     def _rect(self, row: int, column: int):
         """Calculate pygame rectangle for a grid cell."""
@@ -122,6 +163,30 @@ class PygameRenderer:
     def _center(self, row: int, column: int):
         """Calculate center pixel position for a grid cell."""
         return (int((column + 0.5) * self.cell), int((row + 0.5) * self.cell))
+
+    def _calculate_panel_height(self, config) -> int:
+        """Calculate required height for the observation panel.
+
+        Includes: grid visualization, scalars, network diagram.
+        """
+        cell_size = 6
+        gap = 1
+        max_width = 380  # Panel width, not full window width
+        layer_sizes = [1024, 512, 256, 128, 6]
+
+        header_height = 40
+        grid_section = 220
+        scalars_section = 140
+        divider_height = 20
+
+        network_height = 0
+        for total_neurons in layer_sizes:
+            network_height += 18  # Label + spacing
+            columns = min(total_neurons, max_width // (cell_size + gap))
+            rows = (total_neurons + columns - 1) // columns
+            network_height += rows * (cell_size + gap) + 6
+
+        return header_height + grid_section + scalars_section + divider_height + network_height
 
     def draw(self, game: Game, obs_builder=None, network=None) -> None:
         """Render the game board and optionally the state panel.
@@ -163,9 +228,117 @@ class PygameRenderer:
 
         if overlay:
             self._draw_panel(game, obs_builder, network)
+            self._draw_game_stats(game)
 
         pygame.display.flip()
         self.clock.tick(self.fps)
+
+    def _draw_game_stats(self, game: Game) -> None:
+        """Draw game statistics, event log, and Q-value bars in the bottom-left area."""
+        pygame = self.pygame
+
+        font = self.font_small
+        line_height = font.get_height() + 2
+
+        stats_x = 12
+        stats_y = self.board_h + 12
+
+        # GAME STATS with episode metrics
+        self._text(stats_x, stats_y, "GAME STATS", _COLORS["text_dim"], small=True)
+        stats_y += line_height + 4
+
+        agent_alive = "alive" if game.agent.alive else "dead"
+        active_bombs = len(game.bombs)
+        enemies_alive = sum(1 for enemy in game.enemies if enemy.alive)
+        crates_remaining = sum(
+            1 for row in range(game.config.height)
+            for column in range(game.config.width)
+            if game.grid[row, column] == Tile.CRATE
+        )
+
+        stats = [
+            f"step: {game.step_count}/{game.config.max_steps}",
+            f"agent: {agent_alive}",
+            f"bombs: {active_bombs}",
+            f"enemies: {enemies_alive}/{game.config.n_enemies}",
+            f"crates: {crates_remaining}",
+            f"reward: {self.episode_metrics['reward']:.2f}",
+            f"crates_killed: {int(self.episode_metrics['crates'])}",
+            f"enemies_killed: {int(self.episode_metrics['kills'])}",
+        ]
+
+        for stat in stats:
+            surf = font.render(stat, True, _COLORS["text"])
+            self.screen.blit(surf, (stats_x, stats_y))
+            stats_y += line_height
+
+        # EVENT LOG (replaces action history)
+        events_x = stats_x + 160
+        events_y = self.board_h + 12
+
+        self._text(events_x, events_y, "EVENTS", _COLORS["text_dim"], small=True)
+        events_y += line_height + 4
+
+        if self.event_history:
+            for step, event_text, reward in self.event_history:
+                if reward > 0:
+                    color = _COLORS["reward"]
+                elif reward < 0:
+                    color = _COLORS["penalty"]
+                else:
+                    color = _COLORS["text"]
+                display_text = f"{step}: {event_text}"
+                surf = font.render(display_text, True, color)
+                self.screen.blit(surf, (events_x, events_y))
+                events_y += line_height
+        else:
+            surf = font.render("(no events)", True, _COLORS["text_dim"])
+            self.screen.blit(surf, (events_x, events_y))
+
+        # Q-VALUE BARS below game stats
+        qval_y = max(stats_y, events_y) + 8
+        self._text(stats_x, qval_y, "Q-VALUES", _COLORS["text_dim"], small=True)
+        qval_y += line_height + 4
+
+        self._draw_qvalue_bars(stats_x, qval_y)
+
+    def _draw_qvalue_bars(self, start_x: int, start_y: int) -> None:
+        """Draw horizontal bar chart of Q-values."""
+        pygame = self.pygame
+        font = self.font_small
+
+        action_names = ["UP", "DN", "LT", "RT", "BOM", "WT"]
+        max_bar_width = 120
+        bar_height = 10
+
+        q_min = min(self.current_qvalues)
+        q_max = max(self.current_qvalues)
+        q_range = max(0.01, q_max - q_min)
+
+        for i, (name, q_value) in enumerate(zip(action_names, self.current_qvalues)):
+            y = start_y + i * (bar_height + 4)
+
+            # Action name
+            is_selected = (i == self.selected_action)
+            color = _COLORS["ray"] if is_selected else _COLORS["text"]
+            surf = font.render(f"{name}", True, color)
+            self.screen.blit(surf, (start_x, y))
+
+            # Bar background
+            bar_x = start_x + 35
+            bar_width = max_bar_width
+            pygame.draw.rect(self.screen, (40, 40, 50), (bar_x, y, bar_width, bar_height))
+
+            # Filled bar (centered at 0, extends for positive/negative)
+            normalized = (q_value - q_min) / q_range
+            fill_width = int(normalized * bar_width)
+            bar_color = _COLORS["ray"] if is_selected else (100, 150, 200)
+            pygame.draw.rect(self.screen, bar_color, (bar_x, y, fill_width, bar_height))
+
+            # Q-value text
+            value_x = bar_x + bar_width + 8
+            value_surf = font.render(f"{q_value:+.2f}", True, color)
+            self.screen.blit(value_surf, (value_x, y))
 
     def _draw_tiles(self, game: Game) -> None:
         """Draw the game board tiles (walls, crates, empty spaces)."""
@@ -201,17 +374,8 @@ class PygameRenderer:
         pygame.draw.rect(
             self.screen,
             _COLORS["panel"],
-            (panel_left, 0, _PANEL_WIDTH, self.board_h),
+            (panel_left, 0, self.panel_w, self.panel_h),
         )
-        pygame.draw.line(
-            self.screen,
-            (60, 60, 70),
-            (panel_left + obs_width, 0),
-            (panel_left + obs_width, self.board_h),
-            2,
-        )
-        if network is not None:
-            self._draw_network_diagram(obs_builder, network, panel_left + obs_width + 10, 10)
 
         features = obs_builder.features()
         height, width, _ = obs_builder.board_shape
@@ -296,20 +460,27 @@ class PygameRenderer:
             self.screen.blit(surf, (grids_x, scalar_y))
             scalar_y += line_height
 
+        if network is not None:
+            pygame.draw.line(
+                self.screen,
+                (60, 60, 70),
+                (panel_left + 10, scalar_y + 10),
+                (panel_left + _PANEL_WIDTH - 10, scalar_y + 10),
+                2,
+            )
+            self._draw_network_diagram(obs_builder, network, panel_left + 12, scalar_y + 20)
 
+    def _activation_color(self, normalized: float) -> tuple[int, int, int]:
+        """Map a normalized activation (0-1) to an RGB color.
 
-    def _activation_color(self, value: float) -> tuple[int, int, int]:
-        """Map activation value to RGB color.
-
-        Negative values: blue (intensity based on magnitude)
-        Positive values: orange (intensity based on magnitude)
+        0 (lowest in layer): dark blue
+        1 (highest in layer): bright orange
         """
-        if value < 0:
-            intensity = min(255, int(abs(value) * 100))
-            return (0, 100, 200 + min(55, intensity))
-        else:
-            intensity = min(255, int(value * 100))
-            return (200 + min(55, intensity), 120 + min(80, intensity // 2), 40)
+        t = max(0.0, min(1.0, normalized))
+        r = int(20 + t * 235)
+        g = int(30 + t * 150)
+        b = int(120 - t * 100)
+        return (r, g, b)
 
     def _draw_network_diagram(self, obs_builder, network, start_x: int, start_y: int) -> None:
         """Draw neural network activation flow on the right side panel."""
@@ -321,19 +492,18 @@ class PygameRenderer:
         q_values_np = q_values.get().flatten()
         selected_action = int(cp.argmax(q_values).get())
 
-        layer_names = ["H1", "H2", "H3", "OUTPUT"]
-        layer_sizes = [512, 256, 128, 6]
-
+        layer_names = ["H1", "H2", "H3", "H4", "OUTPUT"]
+        layer_sizes = [1024, 512, 256, 128, 6]
         all_activations = [activation.get().flatten() for activation in activations]
 
-        cell_size = 10
+        cell_size = 6
         gap = 1
-        max_width = 780
+        max_width = 380
 
         y = start_y
-        total_neurons = sum(layer_sizes)
-        y = self._text(start_x, y, f"NETWORK ({total_neurons} neurons)", _COLORS["text_dim"], small=True)
-        y += 8
+        total_neurons_all = sum(layer_sizes)
+        y = self._text(start_x, y, f"NETWORK ({total_neurons_all} neurons)", _COLORS["text_dim"], small=True)
+        y += 6
 
         for name, layer_activations, total_neurons in zip(layer_names, all_activations, layer_sizes):
             y = self._text(start_x, y, f"{name} ({total_neurons})", _COLORS["text_dim"], small=True)
@@ -342,16 +512,21 @@ class PygameRenderer:
             columns = min(total_neurons, max_width // (cell_size + gap))
             rows = (total_neurons + columns - 1) // columns
 
+            # Normalize per-layer so variations are visible regardless of scale
+            layer_min = float(layer_activations.min())
+            layer_max = float(layer_activations.max())
+            layer_range = max(1e-6, layer_max - layer_min)
+
             for i in range(total_neurons):
                 row = i // columns
                 column = i % columns
-                value = float(layer_activations[i])
-                color = self._activation_color(value)
+                normalized = (float(layer_activations[i]) - layer_min) / layer_range
+                color = self._activation_color(normalized)
                 x = start_x + column * (cell_size + gap)
                 cell_y = y + row * (cell_size + gap)
                 pygame.draw.rect(self.screen, color, (x, cell_y, cell_size, cell_size))
 
-            y += rows * (cell_size + gap) + 8
+            y += rows * (cell_size + gap) + 6
 
         y += 4
         y = self._text(start_x, y, "Q-VALUES", _COLORS["text_dim"], small=True)
