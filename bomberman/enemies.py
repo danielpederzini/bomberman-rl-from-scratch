@@ -242,8 +242,13 @@ class ScriptedEnemy:
         return True
 
     def _can_escape(self, game: Game, enemy: Player, blast_cells: set[Pos]) -> bool:
-        """Check whether an enemy can reach a safe cell before the bomb explodes."""
-        max_depth = max(0, game.config.bomb_fuse - 2)
+        """Check whether an enemy can reach a safe cell before the bomb explodes.
+
+        Lower ``enemy_skill`` shortens the escape lookahead, so clumsy enemies
+        fail to spot longer escape routes and place fewer aggressive bombs.
+        """
+        full_depth = max(0, game.config.bomb_fuse - 2)
+        max_depth = max(1, round(full_depth * game.config.enemy_skill)) if full_depth else 0
         start = enemy.pos
         queue: deque[tuple[Pos, int]] = deque([(start, 0)])
         visited_positions = {start}
@@ -283,7 +288,16 @@ class ScriptedEnemy:
         return blast_area
 
     def _flee(self, game: Game, enemy: Player, danger_cells: set[Pos]) -> Action:
-        """Find and take the first step toward the nearest safe cell."""
+        """Find and take the first step toward the nearest safe cell.
+
+        Clumsy enemies (low ``enemy_skill``) sometimes flee toward a random safe
+        neighbor instead of the BFS-optimal cell, so they may flee the wrong way.
+        """
+        if self.rng.random() >= game.config.enemy_skill:
+            random_flee = self._wander(game, enemy, danger_cells)
+            if random_flee is not None:
+                return random_flee
+
         safe_cell = self._find_safe_cell_bfs(game, enemy, danger_cells)
 
         if safe_cell is None:
@@ -337,7 +351,12 @@ class ScriptedEnemy:
         """
         start = enemy.pos
 
-        for avoid_danger in (True, False):
+        # Skilled enemies fall back to routing through danger to reach the agent;
+        # clumsy ones hesitate and only chase along safe paths.
+        chase_through_danger = self.rng.random() < game.config.enemy_skill
+        avoid_danger_passes = (True, False) if chase_through_danger else (True,)
+
+        for avoid_danger in avoid_danger_passes:
             queue: deque[Pos] = deque([start])
             came_from: dict[Pos, Pos | None] = {start: None}
             found = False
