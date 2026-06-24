@@ -3,15 +3,17 @@
 Two things are exposed:
 
 * :meth:`ObservationBuilder.features` - a flat ``np.float32`` vector built from
-  an absolute full-board ``height x width`` grid (5 channels) plus scalar
-  features. The whole board is always visible (no agent-centered window).
+  an agent-centered ``CROP_SIZE x CROP_SIZE`` grid (5 channels) plus scalar
+  features. The agent sits at the center of the crop and out-of-bounds cells are
+  encoded as walls.
   Grid channels:
-      ch0 - tile:        0=empty, 0.5=crate, 1=wall
+      ch0 - tile:        0=empty, 0.5=crate, 1=wall (out-of-bounds=1)
       ch1 - danger:      1 if in predicted blast range, else 0
       ch2 - blast:       1 if active blast present, else 0
       ch3 - bomb_imminence: 0=no bomb, 1=detonating next tick
       ch4 - entity:      0=empty, 0.5=enemy, 1=agent
-  Spatial size: height*width*5 (e.g. 11*11*5 = 605).  Scalars: 7.
+  Spatial size: CROP_SIZE^2 * 5 (CROP_SIZE=9 -> 9*9*5 = 405).  Scalars: 12
+  (7 base + safe_up/down/left/right + is_trapped).
 * :meth:`ObservationBuilder.raw_state` - a dict of ground-truth game state.
 """
 
@@ -23,6 +25,8 @@ from bomberman.entities import Tile
 from bomberman.game import Game
 
 _N_CHANNELS = 5
+CROP_SIZE = 9  # egocentric crop window -> CROP_SIZE x CROP_SIZE
+CROP_RADIUS = CROP_SIZE // 2  # agent sits at the exact center
 SCALAR_NAMES = [
     "on_danger",
     "can_bomb",
@@ -31,8 +35,16 @@ SCALAR_NAMES = [
     "agent_row",
     "agent_col",
     "min_fuse",
+    "safe_up",
+    "safe_down",
+    "safe_left",
+    "safe_right",
+    "is_trapped",
 ]
 _SCALAR_FEATURES = len(SCALAR_NAMES)
+
+# (row, col) deltas for UP, DOWN, LEFT, RIGHT used by the safety scalars.
+_CARDINAL_DELTAS = [(-1, 0), (1, 0), (0, -1), (0, 1)]
 
 
 class ObservationBuilder:
@@ -51,8 +63,8 @@ class ObservationBuilder:
 
     @property
     def board_shape(self) -> tuple[int, int, int]:
-        """Return the shape of the observation grid (height, width, channels)."""
-        return (self.game.config.height, self.game.config.width, _N_CHANNELS)
+        """Return the shape of the egocentric observation grid (size, size, channels)."""
+        return (CROP_SIZE, CROP_SIZE, _N_CHANNELS)
 
     @property
     def spatial_size(self) -> int:
@@ -83,22 +95,25 @@ class ObservationBuilder:
         if not agent.alive:
             return np.zeros(self.size, dtype=np.float32)
 
-        spatial = self._board_grid()
+        spatial = self._egocentric_grid()
         scalars = np.asarray(self._scalar_features(), dtype=np.float32)
         return np.concatenate([spatial, scalars])
 
-    def _board_grid(self) -> np.ndarray:
-        """Build a flattened absolute (height x width x 5) grid of the whole board.
+    def _egocentric_grid(self) -> np.ndarray:
+        """Build a flattened agent-centered (size x size x 5) crop of the board.
+
+        The agent is always at the center of the crop. Cells outside the board
+        are encoded as walls (channel 0 = 1.0, all other channels 0.0).
 
         Channels:
-        - 0: Tile type (0=empty, 0.5=crate, 1=wall)
+        - 0: Tile type (0=empty, 0.5=crate, 1=wall; out-of-bounds=1)
         - 1: Danger flag (1 if in blast range)
         - 2: Active blast flag (1 if explosion present)
         - 3: Bomb imminence (0=no bomb, rising to 1=detonating next tick)
         - 4: Entity (0=empty, 0.5=enemy, 1=agent)
         """
         game = self.game
-        height, width = game.config.height, game.config.width
+        size = CROP_SIZE
 
         danger_cells = game.predict_danger_cells()
         blast_cells = game.blast_cells()
@@ -108,26 +123,33 @@ class ObservationBuilder:
             for bomb in game.bombs
         }
         enemy_positions = {enemy.pos for enemy in game.enemies if enemy.alive}
-        agent_pos = game.agent.pos
+        agent_row, agent_column = game.agent.pos
 
-        grid = np.zeros((height, width, _N_CHANNELS), dtype=np.float32)
+        grid = np.zeros((size, size, _N_CHANNELS), dtype=np.float32)
 
-        for row in range(height):
-            for column in range(width):
-                position = (row, column)
+        for row_offset in range(-CROP_RADIUS, size - CROP_RADIUS):
+            for column_offset in range(-CROP_RADIUS, size - CROP_RADIUS):
+                grid_row = row_offset + CROP_RADIUS
+                grid_column = column_offset + CROP_RADIUS
+                position = (agent_row + row_offset, agent_column + column_offset)
+
+                if not game.in_bounds(position):
+                    grid[grid_row, grid_column, 0] = 1.0  # out-of-bounds = wall
+                    continue
+
                 tile = game.tile_at(position)
                 if tile == Tile.WALL:
-                    grid[row, column, 0] = 1.0
+                    grid[grid_row, grid_column, 0] = 1.0
                 elif tile == Tile.CRATE:
-                    grid[row, column, 0] = 0.5
+                    grid[grid_row, grid_column, 0] = 0.5
 
-                grid[row, column, 1] = 1.0 if position in danger_cells else 0.0
-                grid[row, column, 2] = 1.0 if position in blast_cells else 0.0
-                grid[row, column, 3] = bomb_map.get(position, 0.0)
-                if position == agent_pos:
-                    grid[row, column, 4] = 1.0
+                grid[grid_row, grid_column, 1] = 1.0 if position in danger_cells else 0.0
+                grid[grid_row, grid_column, 2] = 1.0 if position in blast_cells else 0.0
+                grid[grid_row, grid_column, 3] = bomb_map.get(position, 0.0)
+                if position == (agent_row, agent_column):
+                    grid[grid_row, grid_column, 4] = 1.0
                 elif position in enemy_positions:
-                    grid[row, column, 4] = 0.5
+                    grid[grid_row, grid_column, 4] = 0.5
 
         return grid.flatten()
 
@@ -262,9 +284,22 @@ class ObservationBuilder:
         game = self.game
         agent = game.agent
         danger_cells = game.predict_danger_cells()
+        blast_cells = game.blast_cells()
 
         on_danger = 1.0 if agent.pos in danger_cells else 0.0
         can_bomb = 1.0 if agent.can_place_bomb() else 0.0
+
+        # Directional safety: a neighbor is safe if walkable and not threatened.
+        safe_flags = []
+        for row_delta, column_delta in _CARDINAL_DELTAS:
+            neighbor = (agent.pos[0] + row_delta, agent.pos[1] + column_delta)
+            safe = (
+                game.is_walkable(neighbor, mover_pid=agent.pid)
+                and neighbor not in danger_cells
+                and neighbor not in blast_cells
+            )
+            safe_flags.append(1.0 if safe else 0.0)
+        is_trapped = 0.0 if any(safe_flags) else 1.0
 
         alive_enemies = [enemy for enemy in game.enemies if enemy.alive]
         if alive_enemies:
@@ -296,6 +331,8 @@ class ObservationBuilder:
             agent_row_norm,
             agent_column_norm,
             min_threatening_bomb_timer_norm,
+            *safe_flags,
+            is_trapped,
         ]
         for ray in self.ray_casts():
             features.append(float(ray["distance_norm"]))
