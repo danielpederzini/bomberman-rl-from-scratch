@@ -25,8 +25,8 @@ from bomberman.entities import Tile
 from bomberman.game import Game
 
 _N_CHANNELS = 5
-CROP_SIZE = 9  # egocentric crop window -> CROP_SIZE x CROP_SIZE
-CROP_RADIUS = CROP_SIZE // 2  # agent sits at the exact center
+CROP_SIZE = 9
+CROP_RADIUS = CROP_SIZE // 2
 SCALAR_NAMES = [
     "on_danger",
     "can_bomb",
@@ -41,9 +41,6 @@ SCALAR_NAMES = [
     "safe_right",
     "is_trapped",
 ]
-_SCALAR_FEATURES = len(SCALAR_NAMES)
-
-# (row, col) deltas for UP, DOWN, LEFT, RIGHT used by the safety scalars.
 _CARDINAL_DELTAS = [(-1, 0), (1, 0), (0, -1), (0, 1)]
 
 
