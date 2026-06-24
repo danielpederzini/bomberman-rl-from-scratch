@@ -51,6 +51,7 @@ class BombermanEnv(gym.Env):
         self.obs_builder = ObservationBuilder(self.game)
         self.enemy_controller = EnemyController(self._rng)
         self._prev_potential = 0.0
+        self._recent_bomb_cells: list[tuple[tuple[int, int], int]] = []
 
         self._renderer = None
 
@@ -76,6 +77,7 @@ class BombermanEnv(gym.Env):
         self.game.reset()
         self.obs_builder = ObservationBuilder(self.game)
         self._prev_potential = self._potential()
+        self._recent_bomb_cells = []
 
         observation = self.obs_builder.features()
         info = self._info()
@@ -102,8 +104,11 @@ class BombermanEnv(gym.Env):
         agent_pos_before = self.game.agent.pos
         tick_result = self.game.tick(player_actions)
 
+        bombs_detonated = max(0, agent_bombs_before - self.game.agent.active_bombs)
+
         reward = self._compute_reward(
-            tick_result, agent_alive_before, agent_action, agent_bombs_before, agent_pos_before
+            tick_result, agent_alive_before, agent_action, agent_bombs_before,
+            agent_pos_before, bombs_detonated,
         )
 
         agent_alive = self.game.agent.alive
@@ -130,16 +135,80 @@ class BombermanEnv(gym.Env):
         agent_action: Action | None = None,
         agent_bombs_before: int = 0,
         agent_pos_before: tuple[int, int] | None = None,
+        bombs_detonated: int = 0,
     ) -> float:
         """Compute total reward as sum of individual shaping components."""
         reward = self.config.reward_step
         reward += self._compute_outcome_rewards(result)
         reward += self._compute_bomb_placement_bonus(agent_action, agent_bombs_before)
+        reward += self._compute_useless_bomb_penalty(result, bombs_detonated)
+        reward += self._compute_suicide_bomb_penalty(agent_action, agent_bombs_before)
         reward += self._compute_terminal_reward(agent_alive_before)
         reward += self._compute_potential_shaping()
         reward += self._compute_idle_penalty(agent_action, agent_pos_before)
         reward += self._compute_safety_reward(agent_alive_before, agent_pos_before)
         return float(reward)
+
+    def _compute_useless_bomb_penalty(self, result, bombs_detonated: int) -> float:
+        """Penalize agent bombs that detonate without destroying a crate or scoring a kill."""
+        if bombs_detonated <= 0:
+            return 0.0
+        crates = result.crates_destroyed.get(0, 0)
+        kills = len(result.kills.get(0, []))
+        if crates == 0 and kills == 0:
+            return self.config.reward_useless_bomb * bombs_detonated
+        return 0.0
+
+    def _compute_suicide_bomb_penalty(self, agent_action: Action | None, agent_bombs_before: int) -> float:
+        """Penalize placing a bomb the agent cannot possibly escape from.
+
+        A bomb is "inescapable" if, starting from the bomb cell, the agent
+        cannot reach any tile outside the bomb's blast within the moves
+        available before the fuse runs out.
+        """
+        placed_bomb = (
+            agent_action == Action.BOMB
+            and self.game.agent.active_bombs > agent_bombs_before
+        )
+        if not placed_bomb:
+            return 0.0
+
+        bomb_pos = self.game.agent.pos
+        bomb = self.game.bomb_at(bomb_pos)
+        if bomb is None:
+            return 0.0
+        if self._bomb_has_escape(bomb_pos, bomb.bomb_range):
+            return 0.0
+        return self.config.reward_suicide_bomb
+
+    def _bomb_has_escape(self, bomb_pos: tuple[int, int], bomb_range: int) -> bool:
+        """Whether a safe (out-of-blast) cell is reachable before the bomb detonates.
+
+        BFS over walkable empty tiles from the bomb cell, bounded by the number
+        of moves the agent gets before the fuse expires (bomb_fuse - 1, since the
+        placement tick consumes the BOMB action).
+        """
+        game = self.game
+        blast_cells = self._get_blast_cells(game, bomb_pos, bomb_range)
+        max_moves = max(0, game.config.bomb_fuse - 1)
+
+        visited = {bomb_pos}
+        queue = deque([(bomb_pos, 0)])
+        while queue:
+            (row, column), distance = queue.popleft()
+            if distance > 0 and (row, column) not in blast_cells:
+                return True
+            if distance >= max_moves:
+                continue
+            for row_delta, column_delta in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                neighbor = (row + row_delta, column + column_delta)
+                if neighbor in visited or not game.in_bounds(neighbor):
+                    continue
+                if game.tile_at(neighbor) != Tile.EMPTY or game.bomb_at(neighbor) is not None:
+                    continue
+                visited.add(neighbor)
+                queue.append((neighbor, distance + 1))
+        return False
 
     def _compute_outcome_rewards(self, result) -> float:
         """Compute rewards for crates destroyed and enemies killed."""
@@ -156,9 +225,38 @@ class BombermanEnv(gym.Env):
         )
         if not placed_bomb:
             return 0.0
+
+        bomb_pos = self.game.agent.pos
+        now = self.game.step_count
+        is_loop = self._is_bomb_loop(bomb_pos, now)
+        self._record_bomb_placement(bomb_pos, now)
+
+        if is_loop:
+            return self.config.reward_bomb_spam
         if self._bomb_threatens_target():
             return self.config.reward_bomb_target
         return self.config.reward_bomb_spam
+
+    def _is_bomb_loop(self, bomb_pos: tuple[int, int], now: int) -> bool:
+        """True if a bomb was recently placed near this cell (bomb/return loop)."""
+        radius = self.config.bomb_loop_radius
+        window = self.config.bomb_loop_window
+        for (prev_pos, prev_step) in self._recent_bomb_cells:
+            if now - prev_step > window:
+                continue
+            manhattan = abs(prev_pos[0] - bomb_pos[0]) + abs(prev_pos[1] - bomb_pos[1])
+            if manhattan <= radius:
+                return True
+        return False
+
+    def _record_bomb_placement(self, bomb_pos: tuple[int, int], now: int) -> None:
+        """Record a bomb placement and prune entries outside the loop window."""
+        window = self.config.bomb_loop_window
+        self._recent_bomb_cells.append((bomb_pos, now))
+        self._recent_bomb_cells = [
+            (pos, step) for (pos, step) in self._recent_bomb_cells
+            if now - step <= window
+        ]
 
     def _compute_terminal_reward(self, agent_alive_before: bool) -> float:
         """Compute reward for terminal outcomes (death or win)."""
