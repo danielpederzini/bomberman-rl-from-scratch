@@ -25,8 +25,7 @@ class Layer:
 
     def forward(self, input: cp.ndarray) -> cp.ndarray:
         self._last_input = input
-        dot_product = cp.dot(input, self.weights)
-        linear_output = dot_product + self.biases
+        linear_output = cp.dot(input, self.weights) + self.biases
         self._last_output = self.activation(linear_output)
         return self._last_output
 
@@ -45,3 +44,7 @@ class Layer:
         self.biases_grad = cp.sum(output_grad, axis=0)
         input_grad = cp.dot(output_grad, self.weights.T)
         return input_grad
+
+    def get_last_output(self) -> cp.ndarray | None:
+        """Return the last forward pass output for visualization."""
+        return self._last_output
