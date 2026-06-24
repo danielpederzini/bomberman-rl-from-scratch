@@ -24,9 +24,23 @@ class DQNetwork:
         for layer in self.layers:
             output = layer.forward(output)
         return output
+
+    def forward_with_activations(self, input: cp.ndarray) -> tuple[cp.ndarray, list[cp.ndarray]]:
+        """Return output and list of layer activations for visualization."""
+        activations = []
+        output = input
+        for layer in self.layers:
+            output = layer.forward(output)
+            activations.append(output.copy())
+        return output, activations
     
     def loss(self, predictions: cp.ndarray, targets: cp.ndarray) -> cp.ndarray:
         return cp.mean(cp.square(predictions - targets))
+
+    def weighted_loss(self, predictions: cp.ndarray, targets: cp.ndarray, weights: cp.ndarray) -> cp.ndarray:
+        """Weighted MSE loss for prioritized experience replay."""
+        squared_errors = cp.square(predictions - targets)
+        return cp.mean(weights * squared_errors)
 
     def backward(self, grad: cp.ndarray):
         for layer in reversed(self.layers):
