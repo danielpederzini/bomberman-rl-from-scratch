@@ -76,31 +76,36 @@ _COLORS = {
     "penalty": (255, 80, 80),   # Red for negative rewards
 }
 
-_HIT_COLORS = {
-    "wall": (200, 200, 210),
-    "crate": (210, 150, 80),
-    "enemy": (255, 80, 100),
-    "bomb": (250, 220, 60),
-}
-
-_PANEL_WIDTH = 1180
+_MAX_CELL = 40
+_MIN_CELL = 10
+_SCREEN_MARGIN = 0.9
+_FEATURE_PANEL_WIDTH = 400
+_STATS_PANEL_WIDTH = 240
+_MIN_FEATURE_PANEL_WIDTH = 280
+_MIN_STATS_PANEL_WIDTH = 210
+_MAX_UI_SCALE = 1.0
+_MIN_UI_SCALE = 0.6
 
 class PygameRenderer:
     """Draws the game in a pygame window. Created lazily on first use."""
 
-    def __init__(self, config, cell_size: int = 40, show_state: bool = False, fps: int = 8):
+    def __init__(self, config, cell_size: int | None = None, show_state: bool = False,
+                 fps: int = 8, max_window_size: tuple[int, int] | None = None):
         """Initialize pygame window with optional state visualization panel.
 
         Args:
             config: Game configuration for board dimensions.
-            cell_size: Pixel size of each grid cell.
+            cell_size: Fixed pixel size per cell. If None, the cell size is
+                auto-fit to the monitor (or ``max_window_size``) so the whole
+                window stays on-screen for any board dimensions.
             show_state: Whether to show observation panel.
             fps: Target frames per second.
+            max_window_size: Optional (width, height) budget overriding the
+                detected monitor size. Useful for tests and manual caps.
         """
         import pygame
         self.pygame = pygame
         self.config = config
-        self.cell = cell_size
         self.show_state = show_state
         self._closed = False
 
@@ -108,24 +113,39 @@ class PygameRenderer:
         pygame.font.init()
         pygame.display.set_caption("Bomberman RL")
 
-        self.board_w = config.width * cell_size
-        self.board_h = config.height * cell_size
+        screen_budget_w, screen_budget_h = self._screen_budget(max_window_size)
+
+        self.cell = self._fit_cell_size(config, cell_size, show_state, screen_budget_w, screen_budget_h)
+
+        self.board_w = config.width * self.cell
+        self.board_h = config.height * self.cell
+
+        self.ui_scale = 1.0
+        self.panel_w = 0
+        self.panel_h = 0
+        self.feature_panel_w = 0
+        self.stats_panel_w = 0
+        self.top_region_h = self.board_h
 
         if show_state:
-            self.panel_w = 400
-            self.panel_h = self._calculate_panel_height(config)
-            game_stats_height = 220  # Height for game stats, events, and Q-values below board
-            window_w = self.board_w + self.panel_w
-            window_h = max(self.board_h + game_stats_height, self.panel_h)
+            natural_panel_h = self._calculate_panel_height(config, 1.0)
+            self.ui_scale = max(_MIN_UI_SCALE, min(_MAX_UI_SCALE, self.board_h / max(1, natural_panel_h)))
+            self.panel_w = self._dashboard_width_for_board(self.board_w, screen_budget_w)
+            self.feature_panel_w, self.stats_panel_w = self._split_dashboard_width(self.panel_w)
+            self.panel_h = self.board_h
+
+        self.left_region_w = self.board_w
+
+        if show_state:
+            window_w = self.left_region_w + self.panel_w
+            window_h = self.board_h
         else:
-            self.panel_w = 0
-            self.panel_h = 0
-            window_w = self.board_w
+            window_w = self.left_region_w
             window_h = self.board_h
 
         self.screen = pygame.display.set_mode((window_w, window_h))
-        self.font = pygame.font.SysFont("consolas", 14)
-        self.font_small = pygame.font.SysFont("consolas", 12)
+        self.font = pygame.font.SysFont("consolas", max(10, int(14 * self.ui_scale)))
+        self.font_small = pygame.font.SysFont("consolas", max(8, int(12 * self.ui_scale)))
         self.clock = pygame.time.Clock()
         self.fps = fps
         self.event_history: list[tuple[int, str, float]] = []
@@ -164,20 +184,70 @@ class PygameRenderer:
         """Calculate center pixel position for a grid cell."""
         return (int((column + 0.5) * self.cell), int((row + 0.5) * self.cell))
 
-    def _calculate_panel_height(self, config) -> int:
+    def _screen_budget(self, max_window_size: tuple[int, int] | None) -> tuple[int, int]:
+        """Return the usable window budget in pixels."""
+        if max_window_size is not None:
+            return max_window_size
+
+        display_info = self.pygame.display.Info()
+        return (
+            int(display_info.current_w * _SCREEN_MARGIN),
+            int(display_info.current_h * _SCREEN_MARGIN),
+        )
+
+    def _dashboard_width_for_board(self, board_w: int, screen_budget_w: int) -> int:
+        """Scale the right dashboard with the board while staying on-screen."""
+        desired_feature_w = max(_MIN_FEATURE_PANEL_WIDTH, int(board_w * 0.65))
+        desired_stats_w = max(_MIN_STATS_PANEL_WIDTH, int(board_w * 0.38))
+        desired_w = desired_feature_w + desired_stats_w
+        remaining_w = max(_MIN_FEATURE_PANEL_WIDTH + _MIN_STATS_PANEL_WIDTH, screen_budget_w - board_w)
+        return min(desired_w, remaining_w)
+
+    def _split_dashboard_width(self, dashboard_w: int) -> tuple[int, int]:
+        """Split the dashboard into feature/network and stats/events columns."""
+        stats_w = max(_MIN_STATS_PANEL_WIDTH, min(int(dashboard_w * 0.38), _STATS_PANEL_WIDTH))
+        feature_w = max(_MIN_FEATURE_PANEL_WIDTH, dashboard_w - stats_w)
+        return feature_w, dashboard_w - feature_w
+
+    def _fit_cell_size(
+        self,
+        config,
+        cell_size: int | None,
+        show_state: bool,
+        screen_budget_w: int,
+        screen_budget_h: int,
+    ) -> int:
+        """Choose the largest cell size that keeps the board window on-screen."""
+        if cell_size is not None:
+            return max(_MIN_CELL, min(_MAX_CELL, int(cell_size)))
+
+        panel_w = self._dashboard_width_for_board(config.width * _MAX_CELL, screen_budget_w) if show_state else 0
+        avail_w = max(_MIN_CELL, screen_budget_w - panel_w)
+        avail_h = max(_MIN_CELL, screen_budget_h)
+
+        fitted_cell = min(
+            _MAX_CELL,
+            avail_w // max(1, config.width),
+            avail_h // max(1, config.height),
+        )
+        return max(_MIN_CELL, int(fitted_cell))
+
+    def _calculate_panel_height(self, config, scale: float | None = None) -> int:
         """Calculate required height for the observation panel.
 
         Includes: grid visualization, scalars, network diagram.
         """
-        cell_size = 6
-        gap = 1
-        max_width = 380  # Panel width, not full window width
-        layer_sizes = [1024, 512, 256, 128, 6]
+        if scale is None:
+            scale = self.ui_scale
+        cell_size = max(2, int(6 * scale))
+        gap = max(1, int(1 * scale))
+        max_width = max(1, int((_FEATURE_PANEL_WIDTH - 20) * scale))
+        layer_sizes = [512, 256, 128, 6]
 
-        header_height = 40
-        grid_section = 220
-        scalars_section = 140
-        divider_height = 20
+        header_height = max(24, int(40 * scale))
+        grid_section = max(90, int(220 * scale))
+        scalars_section = max(90, int(200 * scale))
+        divider_height = max(12, int(20 * scale))
 
         network_height = 0
         for total_neurons in layer_sizes:
@@ -234,18 +304,25 @@ class PygameRenderer:
         self.clock.tick(self.fps)
 
     def _draw_game_stats(self, game: Game) -> None:
-        """Draw game statistics, event log, and Q-value bars in the bottom-left area."""
+        """Draw game statistics, event log, and Q-value bars in the stats panel."""
         pygame = self.pygame
 
         font = self.font_small
-        line_height = font.get_height() + 2
+        scale = self.ui_scale
+        margin = max(6, int(12 * scale))
+        line_height = font.get_height() + max(1, int(2 * scale))
 
-        stats_x = 12
-        stats_y = self.board_h + 12
+        panel_left = self.left_region_w + self.feature_panel_w
+        panel_rect = (panel_left, 0, self.stats_panel_w, self.panel_h)
+        previous_clip = self.screen.get_clip()
+        self.screen.set_clip(panel_rect)
+
+        stats_x = panel_left + margin
+        stats_y = margin
 
         # GAME STATS with episode metrics
         self._text(stats_x, stats_y, "GAME STATS", _COLORS["text_dim"], small=True)
-        stats_y += line_height + 4
+        stats_y += line_height + max(2, int(4 * scale))
 
         agent_alive = "alive" if game.agent.alive else "dead"
         active_bombs = len(game.bombs)
@@ -263,7 +340,7 @@ class PygameRenderer:
             f"enemies: {enemies_alive}/{game.config.n_enemies}",
             f"crates: {crates_remaining}",
             f"reward: {self.episode_metrics['reward']:.2f}",
-            f"crates_killed: {int(self.episode_metrics['crates'])}",
+            f"crates_destroyed: {int(self.episode_metrics['crates'])}",
             f"enemies_killed: {int(self.episode_metrics['kills'])}",
         ]
 
@@ -273,11 +350,11 @@ class PygameRenderer:
             stats_y += line_height
 
         # EVENT LOG (replaces action history)
-        events_x = stats_x + 160
-        events_y = self.board_h + 12
+        events_x = stats_x
+        events_y = stats_y + max(5, int(10 * scale))
 
         self._text(events_x, events_y, "EVENTS", _COLORS["text_dim"], small=True)
-        events_y += line_height + 4
+        events_y += line_height + max(2, int(4 * scale))
 
         if self.event_history:
             for step, event_text, reward in self.event_history:
@@ -296,11 +373,12 @@ class PygameRenderer:
             self.screen.blit(surf, (events_x, events_y))
 
         # Q-VALUE BARS below game stats
-        qval_y = max(stats_y, events_y) + 8
+        qval_y = max(stats_y, events_y) + max(4, int(8 * scale))
         self._text(stats_x, qval_y, "Q-VALUES", _COLORS["text_dim"], small=True)
-        qval_y += line_height + 4
+        qval_y += line_height + max(2, int(4 * scale))
 
         self._draw_qvalue_bars(stats_x, qval_y)
+        self.screen.set_clip(previous_clip)
 
     def _draw_qvalue_bars(self, start_x: int, start_y: int) -> None:
         """Draw horizontal bar chart of Q-values."""
@@ -308,15 +386,17 @@ class PygameRenderer:
         font = self.font_small
 
         action_names = ["UP", "DN", "LT", "RT", "BOM", "WT"]
-        max_bar_width = 120
-        bar_height = 10
+        available_w = max(80, self.stats_panel_w - (start_x - (self.left_region_w + self.feature_panel_w)) - max(16, int(28 * self.ui_scale)) - 54)
+        max_bar_width = min(max(70, int(120 * self.ui_scale)), available_w)
+        bar_height = max(6, int(10 * self.ui_scale))
+        bar_gap = max(3, int(4 * self.ui_scale))
 
         q_min = min(self.current_qvalues)
         q_max = max(self.current_qvalues)
         q_range = max(0.01, q_max - q_min)
 
         for i, (name, q_value) in enumerate(zip(action_names, self.current_qvalues)):
-            y = start_y + i * (bar_height + 4)
+            y = start_y + i * (bar_height + bar_gap)
 
             # Action name
             is_selected = (i == self.selected_action)
@@ -368,14 +448,27 @@ class PygameRenderer:
         """Draw the observation panel with channel grids and network visualization."""
         from bomberman.observation import SCALAR_NAMES, _N_CHANNELS
         pygame = self.pygame
-        panel_left = self.board_w
-        obs_width = 380
+        panel_left = self.left_region_w
+        scale = self.ui_scale
+        margin = max(6, int(12 * scale))
+        obs_width = self.feature_panel_w - 2 * margin
 
+        panel_rect = (panel_left, 0, self.panel_w, self.panel_h)
         pygame.draw.rect(
             self.screen,
             _COLORS["panel"],
-            (panel_left, 0, self.panel_w, self.panel_h),
+            panel_rect,
         )
+        pygame.draw.line(
+            self.screen,
+            (40, 40, 50),
+            (panel_left + self.feature_panel_w, 0),
+            (panel_left + self.feature_panel_w, self.panel_h),
+            1,
+        )
+        previous_clip = self.screen.get_clip()
+        feature_rect = (panel_left, 0, self.feature_panel_w, self.panel_h)
+        self.screen.set_clip(feature_rect)
 
         features = obs_builder.features()
         height, width, _ = obs_builder.board_shape
@@ -383,24 +476,24 @@ class PygameRenderer:
         spatial = features[:spatial_size].reshape(height, width, _N_CHANNELS)
         scalar_features = features[spatial_size:]
 
-        grids_x = panel_left + 12
-        text_y = 10
+        grids_x = panel_left + margin
+        text_y = max(5, int(10 * scale))
         text_y = self._text(
             grids_x, text_y,
             f"step {game.step_count}   obs dim {obs_builder.size}",
             _COLORS["text"],
         )
-        text_y += 2
+        text_y += max(1, int(2 * scale))
 
         channel_names = ["tile", "danger", "blast", "bomb_t", "entity"]
-        mini = 10
-        grid_gap_x = 8
-        grid_gap_y = 6
+        mini = max(4, int(10 * scale))
+        grid_gap_x = max(4, int(8 * scale))
+        grid_gap_y = max(3, int(6 * scale))
 
         def draw_single_grid(channel_index, start_x, start_y):
             """Draw a single channel grid at the given position."""
             self._text(start_x, start_y, channel_names[channel_index], _COLORS["text_dim"], small=True)
-            grid_y = start_y + 12
+            grid_y = start_y + max(8, int(12 * scale))
 
             for grid_row in range(height):
                 for grid_column in range(width):
@@ -440,7 +533,7 @@ class PygameRenderer:
         grid_height = height * mini
         column_positions = [grids_x, grids_x + grid_width + grid_gap_x, grids_x + 2 * (grid_width + grid_gap_x)]
         row_0_y = text_y
-        row_1_y = row_0_y + 12 + grid_height + grid_gap_y
+        row_1_y = row_0_y + max(8, int(12 * scale)) + grid_height + grid_gap_y
 
         draw_single_grid(0, column_positions[0], row_0_y)
         draw_single_grid(1, column_positions[1], row_0_y)
@@ -448,12 +541,12 @@ class PygameRenderer:
         draw_single_grid(3, column_positions[0], row_1_y)
         draw_single_grid(4, column_positions[1], row_1_y)
 
-        scalar_y = row_1_y + 12 + grid_height + 8
+        scalar_y = row_1_y + max(8, int(12 * scale)) + grid_height + max(4, int(8 * scale))
         self._text(grids_x, scalar_y, "SCALARS", _COLORS["text_dim"], small=True)
-        scalar_y += 14
+        scalar_y += max(10, int(14 * scale))
 
         font = self.font_small
-        line_height = font.get_height() + 1
+        line_height = font.get_height() + max(1, int(scale))
 
         for name, value in zip(SCALAR_NAMES, scalar_features):
             surf = font.render(f"{name:<14} {float(value):5.2f}", True, _COLORS["text"])
@@ -461,14 +554,17 @@ class PygameRenderer:
             scalar_y += line_height
 
         if network is not None:
+            divider_y = scalar_y + max(5, int(10 * scale))
             pygame.draw.line(
                 self.screen,
                 (60, 60, 70),
-                (panel_left + 10, scalar_y + 10),
-                (panel_left + _PANEL_WIDTH - 10, scalar_y + 10),
+                (panel_left + margin, divider_y),
+                (panel_left + self.panel_w - margin, divider_y),
                 2,
             )
-            self._draw_network_diagram(obs_builder, network, panel_left + 12, scalar_y + 20)
+            self._draw_network_diagram(obs_builder, network, grids_x, divider_y + max(6, int(10 * scale)), obs_width)
+
+        self.screen.set_clip(previous_clip)
 
     def _activation_color(self, normalized: float) -> tuple[int, int, int]:
         """Map a normalized activation (0-1) to an RGB color.
@@ -482,28 +578,25 @@ class PygameRenderer:
         b = int(120 - t * 100)
         return (r, g, b)
 
-    def _draw_network_diagram(self, obs_builder, network, start_x: int, start_y: int) -> None:
+    def _draw_network_diagram(self, obs_builder, network, start_x: int, start_y: int, max_width: int) -> None:
         """Draw neural network activation flow on the right side panel."""
         pygame = self.pygame
 
         state = obs_builder.features()
         state_cp = cp.array(state.reshape(1, -1), dtype=cp.float32)
-        q_values, activations = network.forward_with_activations(state_cp)
-        q_values_np = q_values.get().flatten()
-        selected_action = int(cp.argmax(q_values).get())
+        _, activations = network.forward_with_activations(state_cp)
 
-        layer_names = ["H1", "H2", "H3", "H4", "OUTPUT"]
-        layer_sizes = [1024, 512, 256, 128, 6]
+        layer_names = ["H1", "H2", "H3", "OUTPUT"]
+        layer_sizes = [512, 256, 128, 6]
         all_activations = [activation.get().flatten() for activation in activations]
 
-        cell_size = 6
-        gap = 1
-        max_width = 380
+        cell_size = max(2, int(6 * self.ui_scale))
+        gap = max(1, int(1 * self.ui_scale))
 
         y = start_y
         total_neurons_all = sum(layer_sizes)
         y = self._text(start_x, y, f"NETWORK ({total_neurons_all} neurons)", _COLORS["text_dim"], small=True)
-        y += 6
+        y += max(3, int(6 * self.ui_scale))
 
         for name, layer_activations, total_neurons in zip(layer_names, all_activations, layer_sizes):
             y = self._text(start_x, y, f"{name} ({total_neurons})", _COLORS["text_dim"], small=True)
@@ -526,19 +619,7 @@ class PygameRenderer:
                 cell_y = y + row * (cell_size + gap)
                 pygame.draw.rect(self.screen, color, (x, cell_y, cell_size, cell_size))
 
-            y += rows * (cell_size + gap) + 6
-
-        y += 4
-        y = self._text(start_x, y, "Q-VALUES", _COLORS["text_dim"], small=True)
-        y += 4
-
-        action_names = ["UP", "DN", "LT", "RT", "BOM", "WT"]
-        for i, (name, q_value) in enumerate(zip(action_names, q_values_np)):
-            is_selected = (i == selected_action)
-            color = _COLORS["ray"] if is_selected else _COLORS["text"]
-            marker = " <<" if is_selected else ""
-            q_text = f"{name}:{q_value:5.2f}{marker}"
-            y = self._text(start_x, y, q_text, color, small=True)
+            y += rows * (cell_size + gap) + max(3, int(6 * self.ui_scale))
 
     def _text(self, text_x: int, text_y: int, text: str, color, small: bool = False) -> int:
         """Render text at the given position and return the next Y coordinate."""
