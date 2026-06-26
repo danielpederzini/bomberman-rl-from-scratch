@@ -10,7 +10,9 @@ Two things are exposed:
       ch0 - tile:        0=empty, 0.5=crate, 1=wall (out-of-bounds=1)
       ch1 - danger:      1 if in predicted blast range, else 0
       ch2 - blast:       1 if active blast present, else 0
-      ch3 - bomb_imminence: 0=no bomb, 1=detonating next tick
+      ch3 - bomb_imminence: 0=no threat, rising to 1 for any cell whose soonest
+                            incoming blast detonates next tick (spans the whole
+                            blast extent, not just the bomb's own cell)
       ch4 - entity:      0=empty, 0.5=enemy, 1=agent
   Spatial size: CROP_SIZE^2 * 5 (CROP_SIZE=9 -> 9*9*5 = 405).  Scalars: 12
   (7 base + safe_up/down/left/right + is_trapped).
@@ -106,7 +108,8 @@ class ObservationBuilder:
         - 0: Tile type (0=empty, 0.5=crate, 1=wall; out-of-bounds=1)
         - 1: Danger flag (1 if in blast range)
         - 2: Active blast flag (1 if explosion present)
-        - 3: Bomb imminence (0=no bomb, rising to 1=detonating next tick)
+        - 3: Bomb imminence (0=no threat, rising to 1 for cells whose soonest
+             incoming blast detonates next tick; covers the full blast extent)
         - 4: Entity (0=empty, 0.5=enemy, 1=agent)
         """
         game = self.game
@@ -114,11 +117,7 @@ class ObservationBuilder:
 
         danger_cells = game.predict_danger_cells()
         blast_cells = game.blast_cells()
-        fuse = max(1, game.config.bomb_fuse)
-        bomb_map = {
-            bomb.pos: (fuse - bomb.timer + 1) / fuse
-            for bomb in game.bombs
-        }
+        imminence_map = self._bomb_imminence_map()
         enemy_positions = {enemy.pos for enemy in game.enemies if enemy.alive}
         agent_row, agent_column = game.agent.pos
 
@@ -142,13 +141,51 @@ class ObservationBuilder:
 
                 grid[grid_row, grid_column, 1] = 1.0 if position in danger_cells else 0.0
                 grid[grid_row, grid_column, 2] = 1.0 if position in blast_cells else 0.0
-                grid[grid_row, grid_column, 3] = bomb_map.get(position, 0.0)
+                grid[grid_row, grid_column, 3] = imminence_map.get(position, 0.0)
                 if position == (agent_row, agent_column):
                     grid[grid_row, grid_column, 4] = 1.0
                 elif position in enemy_positions:
                     grid[grid_row, grid_column, 4] = 0.5
 
         return grid.flatten()
+
+    def _bomb_imminence_map(self) -> dict[tuple[int, int], float]:
+        """Map every threatened cell to its soonest-detonation imminence in [0, 1].
+
+        For each live bomb, the imminence (fuse - timer + 1) / fuse is spread
+        across its entire blast extent (stopping at walls/crates, exactly like a
+        real explosion). When several bombs threaten the same cell the soonest
+        one wins. Active blast cells are already lethal, so they map to 1.0.
+
+        This gives the network per-cell time-to-detonation for cells it is about
+        to step into, instead of timing only at each bomb's own tile.
+        """
+        game = self.game
+        fuse = max(1, game.config.bomb_fuse)
+        imminence: dict[tuple[int, int], float] = {}
+
+        for blast in game.blasts:
+            imminence[blast.pos] = 1.0
+
+        for bomb in game.bombs:
+            value = (fuse - bomb.timer + 1) / fuse
+            cells = [bomb.pos]
+            for row_delta, column_delta in _CARDINAL_DELTAS:
+                for distance in range(1, bomb.bomb_range + 1):
+                    cell = (bomb.pos[0] + row_delta * distance,
+                            bomb.pos[1] + column_delta * distance)
+                    if not game.in_bounds(cell):
+                        break
+                    tile = game.tile_at(cell)
+                    if tile == Tile.WALL:
+                        break
+                    cells.append(cell)
+                    if tile == Tile.CRATE:
+                        break
+            for cell in cells:
+                if value > imminence.get(cell, 0.0):
+                    imminence[cell] = value
+        return imminence
 
     def scalar_names(self) -> list[str]:
         """Return list of scalar feature names.
@@ -312,13 +349,10 @@ class ObservationBuilder:
         agent_row_norm = agent.pos[0] / game.config.height
         agent_column_norm = agent.pos[1] / game.config.width
 
-        min_threatening_bomb_timer_norm = 1.0
-        for bomb in game.bombs:
-            if agent.pos in danger_cells:
-                min_threatening_bomb_timer_norm = min(
-                    min_threatening_bomb_timer_norm,
-                    bomb.timer / max(1, game.config.bomb_fuse),
-                )
+        # 1.0 when the agent's cell is unthreatened, falling toward 0.0 as the
+        # soonest incoming blast at the agent's cell approaches detonation.
+        agent_imminence = self._bomb_imminence_map().get(agent.pos, 0.0)
+        min_threatening_bomb_timer_norm = 1.0 - agent_imminence
 
         features = [
             on_danger,

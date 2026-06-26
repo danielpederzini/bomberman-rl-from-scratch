@@ -102,13 +102,15 @@ class BombermanEnv(gym.Env):
         agent_alive_before = self.game.agent.alive
         agent_bombs_before = self.game.agent.active_bombs
         agent_pos_before = self.game.agent.pos
+        danger_before = set(self.game.predict_danger_cells())
+        escapable_before = self._agent_can_escape()
         tick_result = self.game.tick(player_actions)
 
         bombs_detonated = max(0, agent_bombs_before - self.game.agent.active_bombs)
 
-        reward = self._compute_reward(
+        reward, reward_components = self._compute_reward(
             tick_result, agent_alive_before, agent_action, agent_bombs_before,
-            agent_pos_before, bombs_detonated,
+            agent_pos_before, bombs_detonated, danger_before, escapable_before,
         )
 
         agent_alive = self.game.agent.alive
@@ -123,6 +125,7 @@ class BombermanEnv(gym.Env):
             "kills": tick_result.kills,
             "deaths": tick_result.deaths,
         }
+        info["reward_components"] = reward_components
 
         if self.render_mode == "human":
             self.render()
@@ -136,18 +139,29 @@ class BombermanEnv(gym.Env):
         agent_bombs_before: int = 0,
         agent_pos_before: tuple[int, int] | None = None,
         bombs_detonated: int = 0,
-    ) -> float:
-        """Compute total reward as sum of individual shaping components."""
-        reward = self.config.reward_step
-        reward += self._compute_outcome_rewards(result)
-        reward += self._compute_bomb_placement_bonus(agent_action, agent_bombs_before)
-        reward += self._compute_useless_bomb_penalty(result, bombs_detonated)
-        reward += self._compute_suicide_bomb_penalty(agent_action, agent_bombs_before)
-        reward += self._compute_terminal_reward(agent_alive_before)
-        reward += self._compute_potential_shaping()
-        reward += self._compute_idle_penalty(agent_action, agent_pos_before)
-        reward += self._compute_safety_reward(agent_alive_before, agent_pos_before)
-        return float(reward)
+        danger_before: set[tuple[int, int]] | None = None,
+        escapable_before: bool = True,
+    ) -> tuple[float, dict[str, float]]:
+        """Compute total reward as sum of individual shaping components.
+
+        Returns (total_reward, components) where components maps a
+        human-readable name to that component's contribution, for logging
+        and visualization (e.g. the events panel in the renderer).
+        """
+        components = {
+            "step": self.config.reward_step,
+            "crate_kill": self._compute_outcome_rewards(result),
+            "bomb_placement": self._compute_bomb_placement_bonus(agent_action, agent_bombs_before),
+            "useless_bomb": self._compute_useless_bomb_penalty(result, bombs_detonated),
+            "suicide_bomb": self._compute_suicide_bomb_penalty(agent_action, agent_bombs_before),
+            "terminal": self._compute_terminal_reward(agent_alive_before),
+            "potential_shaping": self._compute_potential_shaping(),
+            "idle": self._compute_idle_penalty(agent_action, agent_pos_before),
+            "safety": self._compute_safety_reward(agent_alive_before, agent_pos_before, danger_before),
+            "lost_escape": self._compute_lost_escape_penalty(escapable_before, agent_action, agent_bombs_before),
+        }
+        total = float(sum(components.values()))
+        return total, components
 
     def _compute_useless_bomb_penalty(self, result, bombs_detonated: int) -> float:
         """Penalize agent bombs that detonate without destroying a crate or scoring a kill."""
@@ -177,26 +191,33 @@ class BombermanEnv(gym.Env):
         bomb = self.game.bomb_at(bomb_pos)
         if bomb is None:
             return 0.0
-        if self._bomb_has_escape(bomb_pos, bomb.bomb_range):
+        if self._bomb_has_escape(bomb_pos):
             return 0.0
         return self.config.reward_suicide_bomb
 
-    def _bomb_has_escape(self, bomb_pos: tuple[int, int], bomb_range: int) -> bool:
-        """Whether a safe (out-of-blast) cell is reachable before the bomb detonates.
+    def _bomb_has_escape(self, bomb_pos: tuple[int, int]) -> bool:
+        """Whether a genuinely safe cell is reachable before the bomb detonates.
 
         BFS over walkable empty tiles from the bomb cell, bounded by the number
         of moves the agent gets before the fuse expires (bomb_fuse - 1, since the
         placement tick consumes the BOMB action).
+
+        A destination only counts as an escape if it is outside *every* current
+        threat - not just this bomb's blast but also any other live bomb/active
+        blast (``predict_danger_cells`` already unions all of them). Paths are
+        also blocked by alive enemies, so a bomb whose only "exit" is into
+        another hazard or behind an enemy is correctly flagged as a suicide.
         """
         game = self.game
-        blast_cells = self._get_blast_cells(game, bomb_pos, bomb_range)
+        agent_pid = game.agent.pid
+        danger_cells = game.predict_danger_cells()
         max_moves = max(0, game.config.bomb_fuse - 1)
 
         visited = {bomb_pos}
         queue = deque([(bomb_pos, 0)])
         while queue:
             (row, column), distance = queue.popleft()
-            if distance > 0 and (row, column) not in blast_cells:
+            if distance > 0 and (row, column) not in danger_cells:
                 return True
             if distance >= max_moves:
                 continue
@@ -206,9 +227,106 @@ class BombermanEnv(gym.Env):
                     continue
                 if game.tile_at(neighbor) != Tile.EMPTY or game.bomb_at(neighbor) is not None:
                     continue
+                if game.alive_player_at(neighbor, exclude_pid=agent_pid) is not None:
+                    continue
                 visited.add(neighbor)
                 queue.append((neighbor, distance + 1))
         return False
+
+    def _compute_lost_escape_penalty(
+        self,
+        escapable_before: bool,
+        agent_action: Action | None,
+        agent_bombs_before: int,
+    ) -> float:
+        """Penalize moves that throw away a still-available escape.
+
+        Fires when the agent was able to reach safety in time *before* the tick
+        but, after acting, no longer can (and is still alive). This is the
+        "walked the wrong way / wasted the timing window" case: a legal move
+        that converts an escapable situation into a doomed one.
+
+        Bomb *placements* are excluded - an inescapable bomb at placement time is
+        already handled by ``_compute_suicide_bomb_penalty``, so this only judges
+        the subsequent escape attempt.
+        """
+        agent = self.game.agent
+        if not agent.alive:
+            return 0.0
+        placed_bomb = (
+            agent_action == Action.BOMB
+            and agent.active_bombs > agent_bombs_before
+        )
+        if placed_bomb:
+            return 0.0
+        if not escapable_before:
+            return 0.0
+        if self._agent_can_escape():
+            return 0.0
+        return self.config.reward_lost_escape
+
+    def _agent_can_escape(self) -> bool:
+        """Whether the agent can still reach a safe cell before it gets caught.
+
+        Returns True immediately if the agent is not currently in any blast
+        threat. Otherwise BFS over walkable empty tiles (blocked by walls,
+        crates, bombs and alive enemies), bounded by the soonest detonation of a
+        bomb that threatens the agent's cell. A node counts as an escape if it
+        is outside *every* current threat (``predict_danger_cells``).
+        """
+        game = self.game
+        agent = game.agent
+        if not agent.alive:
+            return False
+
+        danger_cells = game.predict_danger_cells()
+        start = agent.pos
+        if start not in danger_cells:
+            return True
+
+        max_moves = self._moves_until_detonation()
+        if max_moves <= 0:
+            return False
+
+        agent_pid = agent.pid
+        visited = {start}
+        queue = deque([(start, 0)])
+        while queue:
+            (row, column), distance = queue.popleft()
+            if (row, column) not in danger_cells:
+                return True
+            if distance >= max_moves:
+                continue
+            for row_delta, column_delta in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                neighbor = (row + row_delta, column + column_delta)
+                if neighbor in visited or not game.in_bounds(neighbor):
+                    continue
+                if game.tile_at(neighbor) != Tile.EMPTY or game.bomb_at(neighbor) is not None:
+                    continue
+                if game.alive_player_at(neighbor, exclude_pid=agent_pid) is not None:
+                    continue
+                visited.add(neighbor)
+                queue.append((neighbor, distance + 1))
+        return False
+
+    def _moves_until_detonation(self) -> int:
+        """Moves the agent has before the soonest bomb that threatens it explodes.
+
+        Only bombs whose blast actually covers the agent's current cell count.
+        A bomb with ``timer`` T detonates after T more ticks, and the agent moves
+        once per tick before bombs are resolved, so it gets exactly T escape
+        moves. Returns 0 if no bomb threatens the cell (e.g. already on an active
+        blast), meaning there is no time left to escape.
+        """
+        game = self.game
+        agent_pos = game.agent.pos
+        soonest: int | None = None
+        for bomb in game.bombs:
+            blast = self._get_blast_cells(game, bomb.pos, bomb.bomb_range)
+            if agent_pos in blast:
+                if soonest is None or bomb.timer < soonest:
+                    soonest = bomb.timer
+        return soonest if soonest is not None else 0
 
     def _compute_outcome_rewards(self, result) -> float:
         """Compute rewards for crates destroyed and enemies killed."""
@@ -290,13 +408,25 @@ class BombermanEnv(gym.Env):
             return self.config.reward_idle
         return 0.0
 
-    def _compute_safety_reward(self, agent_alive_before: bool, agent_pos_before: tuple[int, int] | None) -> float:
-        """Compute reward for escaping danger and penalty for walking into it."""
+    def _compute_safety_reward(
+        self,
+        agent_alive_before: bool,
+        agent_pos_before: tuple[int, int] | None,
+        danger_before: set[tuple[int, int]] | None = None,
+    ) -> float:
+        """Compute reward for escaping danger and penalty for walking into it.
+
+        The "before" position is judged against the danger map as it was
+        *before* the tick, while the "after" position is judged against the
+        current (post-tick) danger map, so the two are temporally consistent.
+        """
         agent = self.game.agent
         if not agent_alive_before or not agent.alive or agent_pos_before is None:
             return 0.0
 
-        was_in_danger = agent_pos_before in self.game.predict_danger_cells()
+        if danger_before is None:
+            danger_before = self.game.predict_danger_cells()
+        was_in_danger = agent_pos_before in danger_before
         now_in_danger = agent.pos in self.game.predict_danger_cells()
         if was_in_danger and not now_in_danger:
             return self.config.reward_escape_danger
@@ -507,4 +637,3 @@ class BombermanEnv(gym.Env):
         if self._renderer is not None:
             self._renderer.close()
             self._renderer = None
-

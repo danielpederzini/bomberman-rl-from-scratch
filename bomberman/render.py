@@ -79,7 +79,6 @@ _COLORS = {
 _MAX_CELL = 40
 _MIN_CELL = 10
 _SCREEN_MARGIN = 0.9
-_FEATURE_PANEL_WIDTH = 400
 _STATS_PANEL_WIDTH = 240
 _MIN_FEATURE_PANEL_WIDTH = 280
 _MIN_STATS_PANEL_WIDTH = 210
@@ -115,23 +114,23 @@ class PygameRenderer:
 
         screen_budget_w, screen_budget_h = self._screen_budget(max_window_size)
 
-        self.cell = self._fit_cell_size(config, cell_size, show_state, screen_budget_w, screen_budget_h)
+        self.panel_w = self._dashboard_width(config, screen_budget_w) if show_state else 0
+        self.feature_panel_w, self.stats_panel_w = (
+            self._split_dashboard_width(self.panel_w) if show_state else (0, 0)
+        )
+
+        self.cell = self._fit_cell_size(config, cell_size, self.panel_w, screen_budget_w, screen_budget_h)
 
         self.board_w = config.width * self.cell
         self.board_h = config.height * self.cell
 
         self.ui_scale = 1.0
-        self.panel_w = 0
         self.panel_h = 0
-        self.feature_panel_w = 0
-        self.stats_panel_w = 0
         self.top_region_h = self.board_h
 
         if show_state:
-            natural_panel_h = self._calculate_panel_height(config, 1.0)
+            natural_panel_h = self._calculate_panel_height(self.feature_panel_w, 1.0)
             self.ui_scale = max(_MIN_UI_SCALE, min(_MAX_UI_SCALE, self.board_h / max(1, natural_panel_h)))
-            self.panel_w = self._dashboard_width_for_board(self.board_w, screen_budget_w)
-            self.feature_panel_w, self.stats_panel_w = self._split_dashboard_width(self.panel_w)
             self.panel_h = self.board_h
 
         self.left_region_w = self.board_w
@@ -156,6 +155,7 @@ class PygameRenderer:
             "kills": 0,
         }
         self.current_qvalues: list[float] = [0.0] * 6
+        self.valid_actions: set[int] = set(range(6))
         self.selected_action: int = 0
 
     def record_event(self, step: int, event_type: str, details: str = "", reward: float = 0.0) -> None:
@@ -171,10 +171,21 @@ class PygameRenderer:
         self.episode_metrics["crates"] = crates
         self.episode_metrics["kills"] = kills
 
-    def record_qvalues(self, q_values: list[float], selected_action: int) -> None:
-        """Store Q-values for visualization."""
+    def record_qvalues(self, q_values: list[float], selected_action: int,
+                        valid_actions: list[int] | None = None) -> None:
+        """Store Q-values for visualization.
+
+        Args:
+            q_values: Raw (unmasked) Q-values for all actions.
+            selected_action: The action actually taken (must be a valid action).
+            valid_actions: Indices of actions that weren't masked out. If None,
+                all actions are treated as valid (no masking shown).
+        """
         self.current_qvalues = q_values
         self.selected_action = selected_action
+        self.valid_actions = (
+            set(valid_actions) if valid_actions is not None else set(range(len(q_values)))
+        )
 
     def _rect(self, row: int, column: int):
         """Calculate pygame rectangle for a grid cell."""
@@ -195,13 +206,20 @@ class PygameRenderer:
             int(display_info.current_h * _SCREEN_MARGIN),
         )
 
-    def _dashboard_width_for_board(self, board_w: int, screen_budget_w: int) -> int:
-        """Scale the right dashboard with the board while staying on-screen."""
-        desired_feature_w = max(_MIN_FEATURE_PANEL_WIDTH, int(board_w * 0.65))
-        desired_stats_w = max(_MIN_STATS_PANEL_WIDTH, int(board_w * 0.38))
-        desired_w = desired_feature_w + desired_stats_w
-        remaining_w = max(_MIN_FEATURE_PANEL_WIDTH + _MIN_STATS_PANEL_WIDTH, screen_budget_w - board_w)
-        return min(desired_w, remaining_w)
+    def _dashboard_width(self, config, screen_budget_w: int) -> int:
+        """Decide total dashboard (panel) width directly from the screen budget
+        and the board's cell count, with no dependency on cell size in pixels.
+
+        This removes the old chicken-and-egg problem where panel width was
+        estimated from `config.width * _MAX_CELL` before the real cell size
+        was known, then recomputed afterward from the real (usually smaller)
+        `board_w` -- two different numbers used to make two different
+        decisions, which is what caused the small-board layout breakage.
+        """
+        min_total = _MIN_FEATURE_PANEL_WIDTH + _MIN_STATS_PANEL_WIDTH
+        desired_w = max(min_total, int(config.width * 24))
+        max_affordable = max(min_total, int(screen_budget_w * 0.45))
+        return min(desired_w, max_affordable)
 
     def _split_dashboard_width(self, dashboard_w: int) -> tuple[int, int]:
         """Split the dashboard into feature/network and stats/events columns."""
@@ -213,15 +231,19 @@ class PygameRenderer:
         self,
         config,
         cell_size: int | None,
-        show_state: bool,
+        panel_w: int,
         screen_budget_w: int,
         screen_budget_h: int,
     ) -> int:
-        """Choose the largest cell size that keeps the board window on-screen."""
+        """Choose the largest cell size that keeps the board+panel on-screen.
+
+        `panel_w` must be the *real* dashboard width already decided by
+        `_dashboard_width` (0 if show_state is False) -- not an estimate --
+        so this is now a single algebraic pass with no re-fitting needed.
+        """
         if cell_size is not None:
             return max(_MIN_CELL, min(_MAX_CELL, int(cell_size)))
 
-        panel_w = self._dashboard_width_for_board(config.width * _MAX_CELL, screen_budget_w) if show_state else 0
         avail_w = max(_MIN_CELL, screen_budget_w - panel_w)
         avail_h = max(_MIN_CELL, screen_budget_h)
 
@@ -232,16 +254,23 @@ class PygameRenderer:
         )
         return max(_MIN_CELL, int(fitted_cell))
 
-    def _calculate_panel_height(self, config, scale: float | None = None) -> int:
+    def _calculate_panel_height(self, feature_panel_w: int, scale: float | None = None) -> int:
         """Calculate required height for the observation panel.
 
         Includes: grid visualization, scalars, network diagram.
+
+        `feature_panel_w` must be the actual feature-panel pixel width that
+        will be used to draw (from `_split_dashboard_width`), not the fixed
+        `_FEATURE_PANEL_WIDTH` constant -- otherwise `ui_scale` is computed
+        against a width that's wrong for small boards (where the panel gets
+        floored to `_MIN_FEATURE_PANEL_WIDTH`), and content sized for the
+        assumed width gets crammed into the real, narrower panel.
         """
         if scale is None:
             scale = self.ui_scale
         cell_size = max(2, int(6 * scale))
         gap = max(1, int(1 * scale))
-        max_width = max(1, int((_FEATURE_PANEL_WIDTH - 20) * scale))
+        max_width = max(1, int((feature_panel_w - 20) * scale))
         layer_sizes = [512, 256, 128, 6]
 
         header_height = max(24, int(40 * scale))
@@ -305,8 +334,6 @@ class PygameRenderer:
 
     def _draw_game_stats(self, game: Game) -> None:
         """Draw game statistics, event log, and Q-value bars in the stats panel."""
-        pygame = self.pygame
-
         font = self.font_small
         scale = self.ui_scale
         margin = max(6, int(12 * scale))
@@ -320,7 +347,6 @@ class PygameRenderer:
         stats_x = panel_left + margin
         stats_y = margin
 
-        # GAME STATS with episode metrics
         self._text(stats_x, stats_y, "GAME STATS", _COLORS["text_dim"], small=True)
         stats_y += line_height + max(2, int(4 * scale))
 
@@ -349,7 +375,6 @@ class PygameRenderer:
             self.screen.blit(surf, (stats_x, stats_y))
             stats_y += line_height
 
-        # EVENT LOG (replaces action history)
         events_x = stats_x
         events_y = stats_y + max(5, int(10 * scale))
 
@@ -371,8 +396,8 @@ class PygameRenderer:
         else:
             surf = font.render("(no events)", True, _COLORS["text_dim"])
             self.screen.blit(surf, (events_x, events_y))
+            events_y += line_height
 
-        # Q-VALUE BARS below game stats
         qval_y = max(stats_y, events_y) + max(4, int(8 * scale))
         self._text(stats_x, qval_y, "Q-VALUES", _COLORS["text_dim"], small=True)
         qval_y += line_height + max(2, int(4 * scale))
@@ -381,7 +406,13 @@ class PygameRenderer:
         self.screen.set_clip(previous_clip)
 
     def _draw_qvalue_bars(self, start_x: int, start_y: int) -> None:
-        """Draw horizontal bar chart of Q-values."""
+        """Draw horizontal bar chart of Q-values.
+
+        Masked (invalid) actions are drawn as empty/dimmed bars with no
+        numeric value, since their raw Q-values are meaningless (the agent
+        could never select them) and would otherwise distort the min/max
+        scale used to normalize the valid bars.
+        """
         pygame = self.pygame
         font = self.font_small
 
@@ -391,34 +422,46 @@ class PygameRenderer:
         bar_height = max(6, int(10 * self.ui_scale))
         bar_gap = max(3, int(4 * self.ui_scale))
 
-        q_min = min(self.current_qvalues)
-        q_max = max(self.current_qvalues)
+        valid_q_values = [
+            q_value for i, q_value in enumerate(self.current_qvalues)
+            if i in self.valid_actions
+        ]
+        if valid_q_values:
+            q_min = min(valid_q_values)
+            q_max = max(valid_q_values)
+        else:
+            q_min, q_max = 0.0, 0.0
         q_range = max(0.01, q_max - q_min)
 
         for i, (name, q_value) in enumerate(zip(action_names, self.current_qvalues)):
             y = start_y + i * (bar_height + bar_gap)
-
-            # Action name
+            is_valid = i in self.valid_actions
             is_selected = (i == self.selected_action)
-            color = _COLORS["ray"] if is_selected else _COLORS["text"]
+
+            if not is_valid:
+                color = _COLORS["text_dim"]
+            else:
+                color = _COLORS["ray"] if is_selected else _COLORS["text"]
             surf = font.render(f"{name}", True, color)
             self.screen.blit(surf, (start_x, y))
 
-            # Bar background
             bar_x = start_x + 35
             bar_width = max_bar_width
             pygame.draw.rect(self.screen, (40, 40, 50), (bar_x, y, bar_width, bar_height))
 
-            # Filled bar (centered at 0, extends for positive/negative)
-            normalized = (q_value - q_min) / q_range
-            fill_width = int(normalized * bar_width)
-            bar_color = _COLORS["ray"] if is_selected else (100, 150, 200)
-            pygame.draw.rect(self.screen, bar_color, (bar_x, y, fill_width, bar_height))
+            if is_valid:
+                normalized = (q_value - q_min) / q_range
+                fill_width = int(normalized * bar_width)
+                bar_color = _COLORS["ray"] if is_selected else (100, 150, 200)
+                pygame.draw.rect(self.screen, bar_color, (bar_x, y, fill_width, bar_height))
 
-            # Q-value text
-            value_x = bar_x + bar_width + 8
-            value_surf = font.render(f"{q_value:+.2f}", True, color)
-            self.screen.blit(value_surf, (value_x, y))
+                value_x = bar_x + bar_width + 8
+                value_surf = font.render(f"{q_value:+.2f}", True, color)
+                self.screen.blit(value_surf, (value_x, y))
+            else:
+                value_x = bar_x + bar_width + 8
+                value_surf = font.render("masked", True, _COLORS["text_dim"])
+                self.screen.blit(value_surf, (value_x, y))
 
     def _draw_tiles(self, game: Game) -> None:
         """Draw the game board tiles (walls, crates, empty spaces)."""
@@ -645,4 +688,3 @@ class PygameRenderer:
             self.pygame.quit()
         except Exception:
             pass
-
