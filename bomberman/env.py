@@ -108,7 +108,7 @@ class BombermanEnv(gym.Env):
 
         bombs_detonated = max(0, agent_bombs_before - self.game.agent.active_bombs)
 
-        reward = self._compute_reward(
+        reward, reward_components = self._compute_reward(
             tick_result, agent_alive_before, agent_action, agent_bombs_before,
             agent_pos_before, bombs_detonated, danger_before, escapable_before,
         )
@@ -125,6 +125,7 @@ class BombermanEnv(gym.Env):
             "kills": tick_result.kills,
             "deaths": tick_result.deaths,
         }
+        info["reward_components"] = reward_components
 
         if self.render_mode == "human":
             self.render()
@@ -140,19 +141,27 @@ class BombermanEnv(gym.Env):
         bombs_detonated: int = 0,
         danger_before: set[tuple[int, int]] | None = None,
         escapable_before: bool = True,
-    ) -> float:
-        """Compute total reward as sum of individual shaping components."""
-        reward = self.config.reward_step
-        reward += self._compute_outcome_rewards(result)
-        reward += self._compute_bomb_placement_bonus(agent_action, agent_bombs_before)
-        reward += self._compute_useless_bomb_penalty(result, bombs_detonated)
-        reward += self._compute_suicide_bomb_penalty(agent_action, agent_bombs_before)
-        reward += self._compute_terminal_reward(agent_alive_before)
-        reward += self._compute_potential_shaping()
-        reward += self._compute_idle_penalty(agent_action, agent_pos_before)
-        reward += self._compute_safety_reward(agent_alive_before, agent_pos_before, danger_before)
-        reward += self._compute_lost_escape_penalty(escapable_before, agent_action, agent_bombs_before)
-        return float(reward)
+    ) -> tuple[float, dict[str, float]]:
+        """Compute total reward as sum of individual shaping components.
+
+        Returns (total_reward, components) where components maps a
+        human-readable name to that component's contribution, for logging
+        and visualization (e.g. the events panel in the renderer).
+        """
+        components = {
+            "step": self.config.reward_step,
+            "crate_kill": self._compute_outcome_rewards(result),
+            "bomb_placement": self._compute_bomb_placement_bonus(agent_action, agent_bombs_before),
+            "useless_bomb": self._compute_useless_bomb_penalty(result, bombs_detonated),
+            "suicide_bomb": self._compute_suicide_bomb_penalty(agent_action, agent_bombs_before),
+            "terminal": self._compute_terminal_reward(agent_alive_before),
+            "potential_shaping": self._compute_potential_shaping(),
+            "idle": self._compute_idle_penalty(agent_action, agent_pos_before),
+            "safety": self._compute_safety_reward(agent_alive_before, agent_pos_before, danger_before),
+            "lost_escape": self._compute_lost_escape_penalty(escapable_before, agent_action, agent_bombs_before),
+        }
+        total = float(sum(components.values()))
+        return total, components
 
     def _compute_useless_bomb_penalty(self, result, bombs_detonated: int) -> float:
         """Penalize agent bombs that detonate without destroying a crate or scoring a kill."""
@@ -628,4 +637,3 @@ class BombermanEnv(gym.Env):
         if self._renderer is not None:
             self._renderer.close()
             self._renderer = None
-
