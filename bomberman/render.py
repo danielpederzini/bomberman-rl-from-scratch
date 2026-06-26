@@ -159,9 +159,9 @@ class PygameRenderer:
         self.selected_action: int = 0
 
     def record_event(self, step: int, event_type: str, details: str = "", reward: float = 0.0) -> None:
-        """Record a game event for the event log (max 6 entries)."""
+        """Record a game event for the event log (max 20 entries)."""
         self.event_history.append((step, f"{event_type} {details}", reward))
-        if len(self.event_history) > 6:
+        if len(self.event_history) > 20:
             self.event_history.pop(0)
 
     def update_episode_metrics(self, reward: float, steps: int, crates: int, kills: int) -> None:
